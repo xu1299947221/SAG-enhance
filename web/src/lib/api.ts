@@ -13,7 +13,17 @@ import type {
   ProjectStatsRecord,
   PublicAiProviderSettings,
   PublicMcpSettings,
+  KnowledgeEdgeRecord,
+  RelationConfigRecord,
+  RelationStatsRecord,
+  BatchIngestDocumentResult,
+  BiddingDomainAnalyzeResult,
   ChunkingMode,
+  IngestDocumentInput,
+  IngestDocumentResult,
+  MilvusMarkdownImportInput,
+  MilvusMarkdownImportResult,
+  MilvusMarkdownPreviewResult,
   SearchMode,
   SearchStreamEvent,
   SearchResult,
@@ -99,6 +109,26 @@ export const api = {
     return request<{ graph: ProjectGraphRecord }>(`/api/projects/${projectId}/graph`);
   },
 
+  async listProjectRelations(projectId: string, includeInactive = true) {
+    const query = includeInactive ? "?includeInactive=true" : "";
+    return request<{ relations: KnowledgeEdgeRecord[] }>(`/api/projects/${projectId}/relations${query}`);
+  },
+
+  async getProjectRelationStats(projectId: string) {
+    return request<{ stats: RelationStatsRecord }>(`/api/projects/${projectId}/relations/stats`);
+  },
+
+  async getRelationConfig(projectId: string) {
+    return request<{ config: RelationConfigRecord }>(`/api/projects/${projectId}/relation-config`);
+  },
+
+  async updateRelationConfig(projectId: string, input: Partial<RelationConfigRecord>) {
+    return request<{ config: RelationConfigRecord }>(`/api/projects/${projectId}/relation-config`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    });
+  },
+
   async getDocument(documentId: string) {
     return request<{ document: DocumentRecord }>(`/api/documents/${documentId}`);
   },
@@ -113,6 +143,30 @@ export const api = {
 
   async listEntities(documentId: string) {
     return request<{ entities: EntityRecord[] }>(`/api/documents/${documentId}/entities`);
+  },
+
+  async listDocumentRelations(documentId: string, includeInactive = true) {
+    const query = includeInactive ? "?includeInactive=true" : "";
+    return request<{ relations: KnowledgeEdgeRecord[] }>(`/api/documents/${documentId}/relations${query}`);
+  },
+
+  async updateRelation(edgeId: string, input: Partial<KnowledgeEdgeRecord> & { note?: string }) {
+    return request<{ relation: KnowledgeEdgeRecord }>(`/api/relations/${edgeId}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    });
+  },
+
+  async confirmRelation(edgeId: string) {
+    return request<{ relation: KnowledgeEdgeRecord }>(`/api/relations/${edgeId}/confirm`, { method: "POST" });
+  },
+
+  async rejectRelation(edgeId: string) {
+    return request<{ relation: KnowledgeEdgeRecord }>(`/api/relations/${edgeId}/reject`, { method: "POST" });
+  },
+
+  async disableRelation(edgeId: string) {
+    return request<{ relation: KnowledgeEdgeRecord }>(`/api/relations/${edgeId}/disable`, { method: "POST" });
   },
 
   async updateDocument(documentId: string, input: { title?: string }) {
@@ -192,6 +246,38 @@ export const api = {
     return request<{ job: UploadJobRecord }>(`/api/documents/upload/jobs/${jobId}`);
   },
 
+  async ingestDocument(input: IngestDocumentInput) {
+    return request<IngestDocumentResult>("/ingest", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  },
+
+  async ingestDocuments(input: { documents: IngestDocumentInput[]; continueOnError?: boolean }) {
+    return request<BatchIngestDocumentResult>("/ingest/batch", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  },
+
+  async importMilvusMarkdown(input: MilvusMarkdownImportInput) {
+    return request<MilvusMarkdownImportResult>("/api/debug/import/milvus-markdown", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  },
+
+  async previewMilvusMarkdown(input: MilvusMarkdownImportInput) {
+    return request<MilvusMarkdownPreviewResult>("/api/debug/preview/milvus-markdown", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  },
+
+  async analyzeBiddingDomain(projectId: string) {
+    return request<BiddingDomainAnalyzeResult>(`/api/debug/projects/${projectId}/bidding-domain-analysis`);
+  },
+
   async listModelCallLogs(afterSequence = 0) {
     return request<{
       logs: ModelCallLogRecord[];
@@ -213,6 +299,8 @@ export const api = {
         strategy: "multi",
         searchMode: input.searchMode ?? "fast",
         returnTrace: true,
+        useGraphPaths: true,
+        minEdgeConfidence: 0.65,
         topK: input.topK
       })
     });
@@ -235,6 +323,8 @@ export const api = {
         strategy: "multi",
         searchMode: input.searchMode ?? "fast",
         returnTrace: true,
+        useGraphPaths: true,
+        minEdgeConfidence: 0.65,
         topK: input.topK
       })
     });
@@ -326,6 +416,8 @@ export const api = {
     llmModel: string;
     llmApiKey?: string;
     clearLlmApiKey?: boolean;
+    rerankModel: string;
+    rerankInstruct: string;
     llmTimeoutMs: number;
     llmMaxRetries: number;
     defaultSearchMode: SearchMode;
@@ -333,6 +425,7 @@ export const api = {
     defaultChunkingMode: ChunkingMode;
     chunkTokenLimit: number;
     chunkOverlapTokens: number;
+    biddingDomainConfig?: unknown;
   }) {
     return request<{ settings: PublicAiProviderSettings }>("/api/settings/ai", {
       method: "PUT",

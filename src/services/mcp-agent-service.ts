@@ -45,6 +45,12 @@ type AnswerCitation = {
   toolCallId?: string;
 };
 
+type ToolObservation = {
+  toolName: string;
+  result: unknown;
+  error?: string | null;
+};
+
 export type McpRunStreamEvent =
   | { type: "stage"; label: string; detail?: string }
   | { type: "message"; message: { id: string; sessionId: string; role: string; content: string; metadata: Record<string, unknown>; createdAt: string } }
@@ -304,7 +310,7 @@ export class McpAgentService {
     emit?: StreamEmitter;
   }): Promise<string> {
     let finalText = "";
-    const observations: Array<{ toolName: string; result: unknown; error?: string | null }> = [];
+    const observations: ToolObservation[] = [];
     for (let step = 0; step < 6; step += 1) {
       assertNotAborted(input.signal);
       input.emit?.({ type: "stage", label: `LLM 规划 ${step + 1}`, detail: "正在决定下一步 MCP 工具调用" });
@@ -472,7 +478,7 @@ async function planToolAction(input: {
   history: Array<{ role: string; content: string }>;
   settings: AiRuntimeSettings;
   tools: ToolInfo[];
-  observations: Array<{ toolName: string; result: unknown; error?: string | null }>;
+  observations: ToolObservation[];
   signal?: AbortSignal;
 }): Promise<ToolAction> {
   assertNotAborted(input.signal);
@@ -520,10 +526,10 @@ async function planToolAction(input: {
             id: input.session.id,
             projectId: input.session.sourceIds[0] ?? null
           },
-          recent_messages: input.history.slice(-10),
+          recent_messages: compactRecentMessages(input.history, 6),
           available_tools: input.tools,
-          observations: input.observations,
-          citation_sources: collectCitationSourcesFromObservations(input.observations)
+          observations: compactObservationsForPrompt(input.observations),
+          citation_sources: collectCitationSourcesFromObservations(input.observations, 4, 700)
         })
       }
     ],
@@ -659,8 +665,54 @@ function collectAnswerCitations(toolCalls: McpToolCallRecord[]): AnswerCitation[
   return citations;
 }
 
+function compactRecentMessages(history: Array<{ role: string; content: string }>, limit: number) {
+  return history.slice(-limit).map((message) => ({
+    role: message.role,
+    content: previewForPrompt(message.content, 800)
+  }));
+}
+
+function compactObservationsForPrompt(observations: ToolObservation[]) {
+  return observations.slice(-3).map((observation) => {
+    if (observation.error) {
+      return {
+        toolName: observation.toolName,
+        error: previewForPrompt(observation.error, 800)
+      };
+    }
+    if (observation.toolName === "sag_search" || observation.toolName === "sag_explain_search") {
+      const result = parseToolJsonResult(observation.result);
+      if (isRecord(result)) {
+        const sections = Array.isArray(result.sections)
+          ? result.sections.filter(isRecord).slice(0, 4).map((section) => ({
+              chunkId: typeof section.chunkId === "string" ? section.chunkId : undefined,
+              documentId: typeof section.documentId === "string" ? section.documentId : undefined,
+              externalId: typeof section.externalId === "string" ? section.externalId : undefined,
+              documentTitle: typeof section.documentTitle === "string" ? section.documentTitle : undefined,
+              heading: typeof section.heading === "string" ? section.heading : undefined,
+              score: typeof section.score === "number" ? section.score : undefined,
+              content: previewForPrompt(typeof section.content === "string" ? section.content : "", 700)
+            }))
+          : [];
+        return {
+          toolName: observation.toolName,
+          traceId: typeof result.traceId === "string" ? result.traceId : undefined,
+          sectionCount: Array.isArray(result.sections) ? result.sections.length : sections.length,
+          sections
+        };
+      }
+    }
+    return {
+      toolName: observation.toolName,
+      result: previewForPrompt(JSON.stringify(observation.result), 1600)
+    };
+  });
+}
+
 function collectCitationSourcesFromObservations(
-  observations: Array<{ toolName: string; result: unknown; error?: string | null }>
+  observations: ToolObservation[],
+  limit = 5,
+  contentLimit = 1200
 ) {
   const citations: AnswerCitation[] = [];
   const seenChunkIds = new Set<string>();
@@ -676,9 +728,9 @@ function collectCitationSourcesFromObservations(
       citations.push({
         index: citations.length + 1,
         ...section,
-        content: previewForPrompt(section.content)
+        content: previewForPrompt(section.content, contentLimit)
       });
-      if (citations.length >= 5) {
+      if (citations.length >= limit) {
         return citations;
       }
     }
@@ -726,8 +778,8 @@ function parseToolJsonResult(result: unknown): unknown {
   }
 }
 
-function previewForPrompt(content: string): string {
-  return content.length > 1200 ? `${content.slice(0, 1200)}...` : content;
+function previewForPrompt(content: string, limit = 1200): string {
+  return content.length > limit ? `${content.slice(0, limit)}...` : content;
 }
 
 function resolveMcpServerCommand(): { command: string; args: string[]; cwd: string } {

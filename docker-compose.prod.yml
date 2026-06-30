@@ -1,0 +1,84 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sag-app:latest
+    container_name: sag_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 4173
+      DATABASE_URL: postgres://${POSTGRES_USER:-sag_lite}:${POSTGRES_PASSWORD:-sag_lite_pass}@postgres:5432/${POSTGRES_DB:-sag_lite}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      AUTH_MODE: ${AUTH_MODE:-none}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-large}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.302ai.cn/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-flash}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.302ai.cn/v1}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-60000}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      RERANK_MODEL: ${RERANK_MODEL:-qwen3-rerank}
+      RERANK_INSTRUCT: ${RERANK_INSTRUCT:-Given a user question, rank SAG event candidates by relevance and usefulness for retrieval-augmented question answering.}
+      DEFAULT_SEARCH_MODE: ${DEFAULT_SEARCH_MODE:-fast}
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-5}
+    ports:
+      - "${SAG_APP_BIND:-127.0.0.1}:${SAG_APP_PORT:-4173}:4173"
+    networks:
+      - sag_internal
+
+  migrate:
+    image: sag-app:latest
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-sag_lite}:${POSTGRES_PASSWORD:-sag_lite_pass}@postgres:5432/${POSTGRES_DB:-sag_lite}
+    command: ["node", "dist/src/db/migrate.js"]
+    networks:
+      - sag_internal
+
+  seed:
+    image: sag-app:latest
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-sag_lite}:${POSTGRES_PASSWORD:-sag_lite_pass}@postgres:5432/${POSTGRES_DB:-sag_lite}
+    command: ["node", "dist/src/db/seed.js"]
+    networks:
+      - sag_internal
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: sag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sag_lite}
+      POSTGRES_USER: ${POSTGRES_USER:-sag_lite}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sag_lite_pass}
+    volumes:
+      - ${SAG_PG_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sag_lite} -d ${POSTGRES_DB:-sag_lite}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - sag_internal
+
+networks:
+  sag_internal:
+    driver: bridge

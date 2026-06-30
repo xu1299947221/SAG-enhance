@@ -112,7 +112,7 @@ You need:
 - PostgreSQL
 - pgvector
 
-If you want the fastest setup, use Docker to start PostgreSQL.
+For development, install Node.js and npm locally. For production, Docker/Compose is enough; the Node runtime is packaged in the SAG app image.
 
 ### 2. Clone the Project
 
@@ -131,7 +131,7 @@ cp .env.example .env
 
 ### 4. Start PostgreSQL
 
-Using Docker:
+Development PostgreSQL:
 
 ```bash
 docker compose up -d
@@ -175,6 +175,8 @@ API:   http://localhost:4173
 
 ### 7. Build and Start Production
 
+For local Node production testing:
+
 ```bash
 npm run build
 npm start
@@ -185,6 +187,33 @@ Default production URL:
 ```text
 http://localhost:4173
 ```
+
+For production machines without Node.js, use the production containers:
+
+```bash
+# Prepare the host data directory before the first deployment. It stores PostgreSQL data.
+mkdir -p ./data/postgres
+
+# Build the SAG app image and start PostgreSQL.
+docker compose -f docker-compose.prod.yml up -d --build postgres
+
+# Initialize or migrate the database, then seed default entity types.
+docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
+docker compose -f docker-compose.prod.yml --profile tools run --rm seed
+
+# Start the SAG app container.
+docker compose -f docker-compose.prod.yml up -d app
+```
+
+The production compose file does not expose PostgreSQL to the host. WebUI and API are served by the app container on one port. By default it binds to `127.0.0.1:4173`; set `SAG_APP_BIND=0.0.0.0` only when you intentionally expose it through the host network.
+
+The PostgreSQL data directory is bind-mounted to `./data/postgres` by default. Override it when you want data on a dedicated disk:
+
+```bash
+SAG_PG_DATA_DIR=/data/sag/postgres docker compose -f docker-compose.prod.yml up -d postgres
+```
+
+Development PostgreSQL data defaults to `./data/dev-postgres` and can be changed with `SAG_DEV_PG_DATA_DIR`. The `data/` directory is ignored by Git and Docker build context.
 
 ## First Use
 
@@ -283,6 +312,41 @@ curl -X POST http://localhost:4173/ingest \
   -d '{"sourceId":"project_id","title":"Demo","content":"# Demo\n\nSAG can search project documents.","extract":true}'
 ```
 
+For external systems, pass your own material/file id as `externalId` and enable `replaceExisting`. Re-syncing the same `sourceId + externalId` replaces the old SAG document and rebuilds chunks, events, entities, and relations:
+
+```bash
+curl -X POST http://localhost:4173/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sourceId":"project_id",
+    "externalId":"resource_id_from_your_system",
+    "title":"Certificate - Alice",
+    "content":"Parsed Markdown or plain text from your system",
+    "metadata":{"sourceSystem":"your-system","assetType":"certificate"},
+    "extract":true,
+    "replaceExisting":true
+  }'
+```
+
+Batch ingest:
+
+```bash
+curl -X POST http://localhost:4173/ingest/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "continueOnError": true,
+    "documents": [
+      {
+        "sourceId":"project_id",
+        "externalId":"resource_1",
+        "title":"Material 1",
+        "content":"Material 1 text",
+        "replaceExisting":true
+      }
+    ]
+  }'
+```
+
 Run search:
 
 ```bash
@@ -290,6 +354,8 @@ curl -X POST http://localhost:4173/api/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"Why is SAG suitable for multi-hop retrieval?","sourceIds":["project_id"],"strategy":"multi","searchMode":"fast","topK":5,"returnTrace":true}'
 ```
+
+Search `sections[]` include `externalId`, `documentTitle`, and `documentMetadata`, so callers can map SAG hits back to their own material ids.
 
 Stream search trace:
 

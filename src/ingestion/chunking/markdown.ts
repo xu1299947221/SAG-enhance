@@ -34,7 +34,13 @@ export interface ChunkMarkdownOptions {
 export function chunkMarkdown(content: string, options: ChunkMarkdownOptions = {}): ChunkingResult {
   const mode = options.mode ?? (options.maxTokens == null && options.overlapTokens == null ? "heading_strict" : "token");
   if (mode === "heading_strict") {
-    const sections = buildHeadingStrictSections(content);
+    const maxTokens = normalizeTokenCount(options.maxTokens ?? 512, 64, 8192);
+    const sections = buildHeadingStrictSections(content)
+      .flatMap((section) => section.tokenCount > maxTokens ? splitLargeSection(section, maxTokens) : [section])
+      .map((section, index) => ({
+        ...section,
+        orderIndex: index
+      }));
     return {
       sections,
       chunks: sections.map((section, index) => buildChunk([section], index))

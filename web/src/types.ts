@@ -96,16 +96,140 @@ export interface SearchResult {
     chunkId: string;
     sourceId: string;
     documentId?: string;
+    externalId?: string;
+    documentTitle?: string;
+    documentMetadata?: Record<string, unknown>;
     heading?: string;
     content: string;
     rank: number;
     score: number;
+    why?: SearchResultWhy;
   }>;
   trace?: Record<string, unknown>;
 }
 
+export interface SearchResultWhy {
+  matchedEntities: Array<{ id: string; name: string; type: string; score?: number }>;
+  matchedEdges: KnowledgeEdgeRecord[];
+  graphPaths: KnowledgeGraphPath[];
+  evidence: Array<{ edgeId?: string; chunkId?: string; text: string; score?: number }>;
+  recallType: "graph_path" | "knowledge_edge" | "entity" | "vector" | "fallback";
+  fallback: boolean;
+}
+
 export type SearchMode = "standard" | "fast";
 export type ChunkingMode = "heading_strict" | "token";
+
+export interface IngestDocumentInput {
+  sourceId?: string;
+  externalId?: string;
+  title: string;
+  content: string;
+  metadata?: Record<string, unknown>;
+  extract?: boolean;
+  replaceExisting?: boolean;
+}
+
+export interface IngestDocumentResult {
+  sourceId: string;
+  documentId: string;
+  externalId?: string;
+  replacedDocumentId?: string;
+  replacedDocumentIds?: string[];
+  chunkCount: number;
+  eventCount: number;
+  taskId: string;
+  traceId: string;
+}
+
+export interface BatchIngestDocumentResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: Array<{
+    index: number;
+    ok: boolean;
+    externalId?: string;
+    title?: string;
+    result?: IngestDocumentResult;
+    error?: string;
+  }>;
+}
+
+export interface MilvusMarkdownImportInput {
+  connection: {
+    address: string;
+    username?: string;
+    password?: string;
+    database?: string;
+  };
+  collectionName: string;
+  sourceId?: string;
+  filter?: string;
+  limit?: number;
+  offset?: number;
+  idField?: string;
+  titleField?: string;
+  markdownUrlField?: string;
+  extract?: boolean;
+  replaceExisting?: boolean;
+  continueOnError?: boolean;
+}
+
+export interface MilvusMarkdownImportResult {
+  total: number;
+  fetched: number;
+  succeeded: number;
+  failed: number;
+  sourceId?: string;
+  items: Array<{
+    index: number;
+    ok: boolean;
+    externalId?: string;
+    title?: string;
+    markdownUrl?: string;
+    documentId?: string;
+    chunkCount?: number;
+    eventCount?: number;
+    error?: string;
+  }>;
+}
+
+export interface MilvusMarkdownPreviewResult {
+  total: number;
+  rows: Array<{
+    index: number;
+    externalId?: string;
+    title?: string;
+    markdownUrl?: string;
+    metadata: Record<string, unknown>;
+  }>;
+}
+
+export interface BiddingDomainAnalyzeResult {
+  sourceId: string;
+  documentCount: number;
+  documentType?: string;
+  entities: Array<{
+    name: string;
+    type: string;
+    count: number;
+    aliases?: string[];
+    confidence?: number;
+    reason?: string;
+    documents: Array<{
+      documentId: string;
+      title: string;
+    }>;
+  }>;
+  relations?: Array<{
+    source: string;
+    target: string;
+    relation: string;
+    evidence?: string;
+    confidence?: number;
+  }>;
+}
 
 export interface SearchProgressEvent {
   type: "step";
@@ -122,6 +246,8 @@ export interface ProjectStatsRecord {
   chunkCount: number;
   eventCount: number;
   entityCount: number;
+  knowledgeEdgeCount?: number;
+  lowConfidenceEdgeCount?: number;
 }
 
 export interface ProjectGraphEntityRecord {
@@ -148,6 +274,69 @@ export interface ProjectGraphRecord {
   edges: Array<{
     entityId: string;
     eventId: string;
+  }>;
+  knowledgeEdges?: KnowledgeEdgeRecord[];
+}
+
+export interface KnowledgeEdgeRecord {
+  id: string;
+  sourceId: string;
+  documentId?: string | null;
+  chunkId?: string | null;
+  eventId?: string | null;
+  subjectEntityId: string;
+  objectEntityId: string;
+  subjectName: string;
+  objectName: string;
+  relationType: string;
+  relationLabel: string;
+  evidence?: string | null;
+  evidenceStart?: number | null;
+  evidenceEnd?: number | null;
+  confidence: number;
+  qualityScore?: number;
+  extractionMethod?: string;
+  extractionModel?: string | null;
+  promptVersion?: string | null;
+  status?: "AUTO" | "CONFIRMED" | "REJECTED" | "DISABLED";
+  score?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface KnowledgeGraphPath {
+  nodes: Array<{ entityId: string; name: string; type?: string }>;
+  edges: KnowledgeEdgeRecord[];
+  evidence: Array<{ edgeId: string; text: string; confidence: number }>;
+  score: number;
+  reason: string;
+}
+
+export interface RelationConfigRecord {
+  sourceId: string;
+  disabledRelations: string[];
+  relationAliases: Record<string, string[]>;
+  entityAliases: Record<string, string>;
+  minConfidence: Record<string, number>;
+  customRelations: unknown[];
+  metadata: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RelationStatsRecord {
+  total: number;
+  active: number;
+  confirmed: number;
+  rejected: number;
+  disabled: number;
+  lowConfidence: number;
+  byType: Array<{
+    relationType: string;
+    relationLabel: string;
+    count: number;
+    activeCount: number;
+    avgConfidence: number;
+    avgQualityScore: number;
   }>;
 }
 
@@ -262,6 +451,8 @@ export interface PublicAiProviderSettings {
   llmBaseUrl: string;
   llmModel: string;
   hasLlmApiKey: boolean;
+  rerankModel: string;
+  rerankInstruct: string;
   llmTimeoutMs: number;
   llmMaxRetries: number;
   defaultSearchMode: SearchMode;
@@ -269,6 +460,7 @@ export interface PublicAiProviderSettings {
   defaultChunkingMode: ChunkingMode;
   chunkTokenLimit: number;
   chunkOverlapTokens: number;
+  biddingDomainConfig: unknown;
   updatedAt: string;
 }
 

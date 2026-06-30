@@ -9,6 +9,8 @@ export interface EmbeddingClient {
 }
 
 export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
+  private readonly maxRemoteBatchSize = 10;
+
   async generate(text: string): Promise<number[]> {
     const [embedding] = await this.batchGenerate([text]);
     return embedding;
@@ -39,6 +41,14 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
         }))
       });
       return embeddings;
+    }
+
+    if (texts.length > this.maxRemoteBatchSize) {
+      const batches: number[][][] = [];
+      for (let index = 0; index < texts.length; index += this.maxRemoteBatchSize) {
+        batches.push(await this.batchGenerate(texts.slice(index, index + this.maxRemoteBatchSize)));
+      }
+      return batches.flat();
     }
 
     const url = `${settings.embeddingBaseUrl.replace(/\/$/, "")}/embeddings`;

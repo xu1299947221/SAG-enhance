@@ -17,7 +17,7 @@ vi.mock("../src/db/pool.js", () => ({
   pool: db.pool
 }));
 
-import { deleteDocument } from "../src/db/repositories.js";
+import { deleteDocument, deleteDocumentByExternalId } from "../src/db/repositories.js";
 
 describe("deleteDocument repository operation", () => {
   beforeEach(() => {
@@ -40,17 +40,16 @@ describe("deleteDocument repository operation", () => {
       tenantId: "default"
     })).resolves.toBe(true);
 
-    expect(db.client.query).toHaveBeenCalledTimes(5);
+    expect(db.client.query).toHaveBeenCalledTimes(4);
     expect(normalizeSql(db.client.query.mock.calls[0][0])).toBe("begin");
     expect(normalizeSql(db.client.query.mock.calls[1][0])).toContain("join sources s on s.id = d.source_id");
     expect(normalizeSql(db.client.query.mock.calls[1][0])).toContain("where d.id = $1 and s.tenant_id = $2");
     expect(normalizeSql(db.client.query.mock.calls[1][0])).toContain("for update");
     expect(normalizeSql(db.client.query.mock.calls[2][0])).toContain("candidate_entities");
     expect(normalizeSql(db.client.query.mock.calls[2][0])).toContain("shared_entities");
-    expect(normalizeSql(db.client.query.mock.calls[2][0])).toContain("ent.id not in (select entity_id from shared_entities)");
-    expect(normalizeSql(db.client.query.mock.calls[3][0])).toContain("delete from documents d using sources s");
-    expect(normalizeSql(db.client.query.mock.calls[3][0])).toContain("d.source_id = s.id and d.id = $1 and s.tenant_id = $2");
-    expect(normalizeSql(db.client.query.mock.calls[4][0])).toBe("commit");
+    expect(normalizeSql(db.client.query.mock.calls[2][0])).toContain("delete from documents");
+    expect(normalizeSql(db.client.query.mock.calls[2][0])).toContain("id not in (select entity_id from shared_entities)");
+    expect(normalizeSql(db.client.query.mock.calls[3][0])).toBe("commit");
     expect(db.client.release).toHaveBeenCalledTimes(1);
   });
 
@@ -70,6 +69,35 @@ describe("deleteDocument repository operation", () => {
     expect(normalizeSql(db.client.query.mock.calls[1][0])).toContain("s.tenant_id = $2");
     expect(normalizeSql(db.client.query.mock.calls[2][0])).toBe("rollback");
     expect(db.client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes every document matching a source external id using the provided transaction client", async () => {
+    const externalClient = {
+      query: vi.fn()
+        .mockResolvedValueOnce({
+          rows: [
+            { id: "00000000-0000-0000-0000-000000000021" },
+            { id: "00000000-0000-0000-0000-000000000022" }
+          ]
+        })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+    };
+
+    await expect(deleteDocumentByExternalId({
+      sourceId: "00000000-0000-0000-0000-000000000001",
+      externalId: "rag-resource-1",
+      tenantId: "default"
+    }, externalClient)).resolves.toEqual([
+      "00000000-0000-0000-0000-000000000021",
+      "00000000-0000-0000-0000-000000000022"
+    ]);
+
+    expect(externalClient.query).toHaveBeenCalledTimes(3);
+    expect(normalizeSql(externalClient.query.mock.calls[0][0])).toContain("where d.source_id = $1 and d.external_id = $2 and s.tenant_id = $3");
+    expect(normalizeSql(externalClient.query.mock.calls[0][0])).not.toContain("limit 1");
+    expect(normalizeSql(externalClient.query.mock.calls[1][0])).toContain("delete from documents");
+    expect(normalizeSql(externalClient.query.mock.calls[2][0])).toContain("delete from documents");
   });
 });
 

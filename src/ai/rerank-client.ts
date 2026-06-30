@@ -1,4 +1,3 @@
-import { config } from "../config/env.js";
 import { aiSettingsService, type AiRuntimeSettings } from "../services/ai-settings-service.js";
 import { createModelCallLogger } from "../observability/model-call-log.js";
 import type { EventRecord } from "../types.js";
@@ -45,19 +44,20 @@ export class QwenRerankClient implements RerankClient {
     candidates: EventRecord[];
     topK: number;
   }): Promise<string[]> {
-    const url = buildRerankUrl(settings.llmBaseUrl);
+    const urls = buildRerankUrls(settings.llmBaseUrl);
     const documents = input.candidates.map((candidate) => eventToRerankDocument(candidate, input.candidates.length));
     const body = {
-      model: config.RERANK_MODEL,
+      model: settings.rerankModel,
       documents,
       query: input.query,
       top_n: Math.min(input.topK, input.candidates.length),
-      instruct: config.RERANK_INSTRUCT
+      instruct: settings.rerankInstruct
     };
 
     let lastError: unknown;
     const maxAttempts = settings.llmMaxRetries + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const url = urls[Math.min(attempt - 1, urls.length - 1)];
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), settings.llmTimeoutMs);
       const log = createModelCallLogger({
@@ -97,6 +97,12 @@ export class QwenRerankClient implements RerankClient {
           });
           logged = true;
           lastError = error;
+          if (isUnsupportedRerankStatus(response.status) && attempt < urls.length) {
+            continue;
+          }
+          if (isUnsupportedRerankStatus(response.status)) {
+            return localScoreRerank(input.query, input.candidates, input.topK);
+          }
           if (attempt < maxAttempts && isRetryableHttpStatus(response.status)) {
             await waitBeforeRetry(attempt);
             continue;
@@ -129,15 +135,18 @@ export class QwenRerankClient implements RerankClient {
   }
 }
 
-function buildRerankUrl(baseUrl: string): string {
+function buildRerankUrls(baseUrl: string): string[] {
   const base = baseUrl.replace(/\/$/, "");
   if (base.endsWith("/v1")) {
-    return `${base}/reranks`;
+    return [`${base}/reranks`, `${base}/rerank`];
   }
   if (base.endsWith("/reranks")) {
-    return base;
+    return [base];
   }
-  return `${base}/v1/reranks`;
+  if (base.endsWith("/rerank")) {
+    return [base];
+  }
+  return [`${base}/v1/reranks`, `${base}/v1/rerank`];
 }
 
 function eventToRerankDocument(event: EventRecord, candidateCount: number): string {
@@ -246,6 +255,10 @@ async function readResponseBody(response: Response): Promise<{ responseText: str
 
 function isRetryableHttpStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
+}
+
+function isUnsupportedRerankStatus(status: number): boolean {
+  return status === 400 || status === 404 || status === 405;
 }
 
 function isRetryableFetchError(error: unknown): boolean {

@@ -4,11 +4,16 @@ import { embeddingClient, type EmbeddingClient } from "../ai/embedding-client.js
 import { llmClient, type LlmClient } from "../ai/llm-client.js";
 import { rerankClient, type RerankClient } from "../ai/rerank-client.js";
 import { MAX_SEARCH_TOP_K, aiSettingsService } from "./ai-settings-service.js";
+import { expandBiddingQuery, extractBiddingDomainEntities } from "../domain/bidding-domain.js";
 import {
   assertSourcesAccessible,
   coarseRankEventsByContent,
+  getEntitiesByIds,
+  getEdgesForSections,
   getEventIdsByEntityIds,
   getEventsWithEntityIds,
+  getRelationConfig,
+  getSectionsForKnowledgeEdges,
   getSectionsForEvents,
   searchChunksByVector,
   searchEntitiesByName,
@@ -16,6 +21,8 @@ import {
   searchEntitiesByVector,
   searchEventsByTitleVector
 } from "../db/repositories.js";
+import { graphStore } from "./graph-store.js";
+import { normalizeRelation } from "../domain/relation-ontology.js";
 import type {
   EntityRecord,
   EventRecord,
@@ -23,6 +30,7 @@ import type {
   SearchInput,
   SearchProgressEvent,
   SearchResult,
+  SearchResultWhy,
   SearchSection,
   SearchTrace,
   SearchTraceEvent
@@ -63,7 +71,7 @@ export class SearchService {
     if (strategy === "vector") {
       return this.vectorSearch(input, emit);
     }
-    return this.multiSearch(input, emit);
+    return this.multiSearch(input, tenantId, emit);
   }
 
   async vectorSearch(input: SearchInput, emit?: SearchProgressEmitter): Promise<SearchResult> {
@@ -89,8 +97,9 @@ export class SearchService {
     };
   }
 
-  async multiSearch(input: SearchInput, emit?: SearchProgressEmitter): Promise<SearchResult> {
+  async multiSearch(input: SearchInput, tenantId = config.DEFAULT_TENANT_ID, emit?: SearchProgressEmitter): Promise<SearchResult> {
     const runtimeSettings = await aiSettingsService.getRuntimeSettings();
+    const relationConfigs = await Promise.all(input.sourceIds.map((sourceId) => getRelationConfig({ sourceId, tenantId }).catch(() => null)));
     const options = resolveMultiOptions(input, runtimeSettings.defaultSearchTopK);
     const searchMode = input.searchMode ?? runtimeSettings.defaultSearchMode;
     const traceId = randomUUID();
@@ -99,6 +108,7 @@ export class SearchService {
       traceId,
       query: input.query,
       searchMode,
+      relationIntent: inferRelationIntent(input.query, input.relationTypes),
       queryEntities: [],
       recalledEntities: [],
       entityEventIds: [],
@@ -113,19 +123,47 @@ export class SearchService {
       title: "查询向量化",
       detail: "把用户问题转成向量，用于召回相关事件和切片。"
     });
+    const configuredEntityAliases = relationConfigs.flatMap((item) => {
+      if (!item) return [];
+      return Object.entries(item.entityAliases).flatMap(([alias, canonical]) => [alias, canonical]);
+    });
+    const configuredRelationAliases = relationConfigs.flatMap((item) => {
+      if (!item) return [];
+      return Object.entries(item.relationAliases).flatMap(([type, aliases]) => [type, ...aliases]);
+    });
+    const expandedQueryEntities = expandBidQueryEntities(input.query, runtimeSettings.biddingDomainConfig);
+    const domainQueryEntities = extractBiddingDomainEntities(input.query, runtimeSettings.biddingDomainConfig);
+    const expandedTextQuery = buildExpandedTextQuery(input.query, [
+      ...expandedQueryEntities,
+      ...configuredEntityAliases,
+      ...configuredRelationAliases
+    ]);
 
     let queryEntities: string[] = [];
     let recalledEntities: EntityRecord[] = [];
     if (searchMode === "fast") {
       recalledEntities = await timed(timings, "step1Bm25Entities", () => searchEntitiesByText({
         sourceIds: input.sourceIds,
-        query: input.query,
+        query: expandedTextQuery,
         limit: options.entityTopK
       }), emit, {
         title: "BM25 匹配查询实体",
-        detail: "直接用用户问题在实体库做全文/BM25 匹配，不调用 LLM 抽取 key。"
+        detail: "直接用用户问题和应标同义词在实体库做全文/BM25 匹配，不调用 LLM 抽取 key。"
       });
-      queryEntities = recalledEntities.map((entity) => entity.name);
+      queryEntities = unique([...domainQueryEntities, ...expandedQueryEntities, ...configuredEntityAliases, ...recalledEntities.map((entity) => entity.name)]);
+      if (recalledEntities.length === 0) {
+        const vectorEntities = await timed(timings, "step1VectorEntities", () => searchEntitiesByVector({
+          sourceIds: input.sourceIds,
+          queryVector,
+          topK: options.entityTopK,
+          threshold: Math.min(options.keySimilarityThreshold, 0.72)
+        }), emit, {
+          title: "向量召回查询实体",
+          detail: "BM25 没有命中时，使用用户问题向量直接召回图谱实体。"
+        });
+        recalledEntities = dedupeEntities(vectorEntities);
+        queryEntities = unique([...queryEntities, ...recalledEntities.map((entity) => entity.name)]);
+      }
       trace.queryEntities = queryEntities;
       emitSearchStep(emit, timings, "step1Bm25Entities", {
         title: "BM25 匹配查询实体",
@@ -142,10 +180,11 @@ export class SearchService {
         title: "抽取查询实体",
         detail: "识别用户问题中的关键实体。"
       });
+      queryEntities = unique([...domainQueryEntities, ...queryEntities, ...expandedQueryEntities, ...configuredEntityAliases]);
       trace.queryEntities = queryEntities;
       emitSearchStep(emit, timings, "step1ExtractEntities", {
         title: "抽取查询实体",
-        detail: queryEntities.length === 0 ? "没有识别到查询实体" : `识别到 ${queryEntities.length} 个查询实体`,
+        detail: queryEntities.length === 0 ? "没有识别到查询实体" : `识别/扩展到 ${queryEntities.length} 个查询实体`,
         payload: queryEntities
       });
 
@@ -216,7 +255,84 @@ export class SearchService {
       payload: trace.queryEvents
     });
 
-    const seedEventIds = unique([...entityEventIds, ...queryEvents.map((event) => event.id)]);
+    const disabledRelations = new Set(relationConfigs.flatMap((item) => item?.disabledRelations ?? []));
+    const relationTypes = normalizeRelationTypes(input.relationTypes ?? trace.relationIntent ?? []).filter((type) => !disabledRelations.has(type));
+    const configuredMinConfidence = Math.max(0, ...relationConfigs.flatMap((item) => Object.values(item?.minConfidence ?? {}).filter((value): value is number => typeof value === "number")));
+    const minEdgeConfidence = input.minEdgeConfidence ?? Math.max(0.65, configuredMinConfidence);
+    const useGraphPaths = input.useGraphPaths ?? true;
+    const recalledEdges = await timed(timings, "step3KnowledgeEdges", () => graphStore.searchEdges({
+      sourceIds: input.sourceIds,
+      query: expandedTextQuery,
+      entityIds: recalledEntities.map((entity) => entity.id),
+      eventIds: unique([...entityEventIds, ...queryEvents.map((event) => event.id)]),
+      relationTypes,
+      minConfidence: minEdgeConfidence,
+      limit: Math.min(options.entityTopK, 20)
+    }), emit, {
+      title: "强关系召回",
+      detail: "按查询、实体和候选事件召回 subject-relation-object 强关系边。"
+    });
+    trace.recalledEdges = recalledEdges;
+    const graphPaths = useGraphPaths
+      ? await timed(timings, "step3GraphPaths", () => graphStore.expandPaths({
+          sourceIds: input.sourceIds,
+          seedEntityIds: unique([
+            ...recalledEntities.map((entity) => entity.id),
+            ...recalledEdges.flatMap((edge) => [edge.subjectEntityId, edge.objectEntityId])
+          ]),
+          relationTypes,
+          minConfidence: minEdgeConfidence,
+          maxDepth: Math.max(1, Math.min(options.maxHops || 2, 3)),
+          limit: Math.min(options.entityTopK, 20)
+        }), emit, {
+          title: "关系路径扩展",
+          detail: "沿强关系边扩展 1-3 跳路径，并保留证据链。"
+        })
+      : [];
+    trace.graphPaths = graphPaths;
+    trace.explanation = {
+      recallTypes: [
+        ...(recalledEntities.length > 0 ? ["entity"] : []),
+        ...(recalledEdges.length > 0 ? ["knowledge_edge"] : []),
+        ...(graphPaths.length > 0 ? ["graph_path"] : []),
+        ...(queryEvents.length > 0 ? ["vector_event"] : [])
+      ],
+      edgeCount: recalledEdges.length,
+      pathCount: graphPaths.length
+    };
+    emitSearchStep(emit, timings, "step3KnowledgeEdges", {
+      title: "强关系召回",
+      detail: recalledEdges.length === 0 ? "没有召回强关系边" : `召回 ${recalledEdges.length} 条强关系边`,
+      payload: recalledEdges.map((edge) => ({
+        id: edge.id,
+        subject: edge.subjectName,
+        relation: edge.relationLabel,
+        relationType: edge.relationType,
+        object: edge.objectName,
+        confidence: edge.confidence,
+        score: edge.score ?? 0,
+        eventId: edge.eventId
+      }))
+    });
+    if (useGraphPaths) {
+      emitSearchStep(emit, timings, "step3GraphPaths", {
+        title: "关系路径扩展",
+        detail: graphPaths.length === 0 ? "没有扩展出强关系路径" : `扩展出 ${graphPaths.length} 条强关系路径`,
+        payload: graphPaths.map((path) => ({
+          reason: path.reason,
+          score: path.score,
+          evidence: path.evidence
+        }))
+      });
+    }
+
+    const relationEventIds = recalledEdges
+      .map((edge) => edge.eventId)
+      .filter((id): id is string => Boolean(id));
+    const pathEventIds = graphPaths
+      .flatMap((path) => path.edges.map((edge) => edge.eventId))
+      .filter((id): id is string => Boolean(id));
+    const seedEventIds = unique([...entityEventIds, ...queryEvents.map((event) => event.id), ...relationEventIds, ...pathEventIds]);
     if (seedEventIds.length === 0) {
       trace.fallbackReason = "no seed events; used vector chunk search";
       emitSearchStep(emit, timings, "fallback", {
@@ -238,6 +354,35 @@ export class SearchService {
       detail: `读取 ${seedEvents.size} 个候选事件详情`,
       payload: toTraceEvents([...seedEvents.values()])
     });
+    if (recalledEntities.length === 0) {
+      const inferredEntityIds = collectEntityIdsFromRankedEvents(
+        queryEvents.map((event) => event.id),
+        seedEvents,
+        Math.min(options.entityTopK, 8)
+      );
+      const inferredEntities = await timed(timings, "step4InferEntitiesFromEvents", () => getEntitiesByIds({
+        sourceIds: input.sourceIds,
+        entityIds: inferredEntityIds,
+        limit: Math.min(options.entityTopK, 8)
+      }), emit, {
+        title: "从语义事件回填实体",
+        detail: "实体召回为空时，从语义召回事件反推关联实体，补齐图谱链路。"
+      });
+      recalledEntities = dedupeEntities(inferredEntities);
+      queryEntities = unique([...queryEntities, ...recalledEntities.map((entity) => entity.name)]);
+      trace.queryEntities = queryEntities;
+      trace.recalledEntities = recalledEntities.map((entity) => ({
+        id: entity.id,
+        name: entity.name,
+        type: entity.type,
+        score: entity.score ?? 0
+      }));
+      emitSearchStep(emit, timings, "step4InferEntitiesFromEvents", {
+        title: "从语义事件回填实体",
+        detail: recalledEntities.length === 0 ? "语义事件没有可回填实体" : `回填 ${recalledEntities.length} 个实体`,
+        payload: trace.recalledEntities
+      });
+    }
     const expanded = await timed(timings, "step5Expand", () => this.expandEvents({
       seedEvents,
       initialEntityIds: recalledEntities.map((entity) => entity.id),
@@ -334,6 +479,14 @@ export class SearchService {
       title: "回取关联切片",
       detail: "读取最终事件关联的原文切片。"
     });
+    const graphSections = await timed(timings, "step8FetchGraphChunks", () => getSectionsForKnowledgeEdges(unique([
+      ...recalledEdges.map((edge) => edge.id),
+      ...graphPaths.flatMap((path) => path.edges.map((edge) => edge.id))
+    ])), emit, {
+      title: "回取关系证据切片",
+      detail: "读取强关系边直接指向的原文证据切片。"
+    });
+    mergeGraphSections(sections, graphSections, options.maxSections);
     if (sections.length < options.maxSections) {
       const supplemental = await searchChunksByVector({
         sourceIds: input.sourceIds,
@@ -362,10 +515,21 @@ export class SearchService {
         rank: section.rank
       }))
     });
+    const edgesForSections = await getEdgesForSections({
+      chunkIds: sections.slice(0, options.maxSections).map((section) => section.chunkId)
+    });
+    const finalSections = attachWhyToSections({
+      sections: sections.slice(0, options.maxSections),
+      recalledEntities,
+      recalledEdges,
+      graphPaths,
+      edgesForSections,
+      fallback: Boolean(trace.fallbackReason)
+    });
 
     return {
       traceId,
-      sections: sections.slice(0, options.maxSections),
+      sections: finalSections,
       trace: input.returnTrace ? trace : undefined
     };
   }
@@ -508,6 +672,9 @@ export class SearchService {
         chunkId: section.chunkId,
         sourceId: section.sourceId,
         documentId: section.documentId,
+        externalId: section.externalId,
+        documentTitle: section.documentTitle,
+        documentMetadata: section.documentMetadata,
         heading: section.heading,
         content: section.content,
         rank: section.rank,
@@ -557,6 +724,32 @@ function collectNewEntityIds(
   return ids.filter((id) => !trackedEntities.has(id));
 }
 
+function collectEntityIdsFromRankedEvents(
+  rankedEventIds: string[],
+  events: Map<string, EventRecord & { entityIds: string[] }>,
+  limit: number
+): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const eventId of rankedEventIds.slice(0, 5)) {
+    const event = events.get(eventId);
+    if (!event) {
+      continue;
+    }
+    for (const entityId of event.entityIds) {
+      if (seen.has(entityId)) {
+        continue;
+      }
+      seen.add(entityId);
+      ids.push(entityId);
+      if (ids.length >= limit) {
+        return ids;
+      }
+    }
+  }
+  return ids;
+}
+
 function unique<T>(items: Iterable<T>): T[] {
   return [...new Set(items)];
 }
@@ -572,6 +765,124 @@ function dedupeEntities(entities: EntityRecord[]): EntityRecord[] {
     result.push(entity);
   }
   return result;
+}
+
+export function expandBidQueryEntities(query: string, domainConfig?: Parameters<typeof expandBiddingQuery>[1]): string[] {
+  return expandBiddingQuery(query, domainConfig);
+}
+
+function inferRelationIntent(query: string, explicitTypes?: string[]): string[] {
+  if (explicitTypes && explicitTypes.length > 0) {
+    return normalizeRelationTypes(explicitTypes);
+  }
+  const intents: string[] = [];
+  if (/要求|需要|必须|须|资质|证书|资格|条件/.test(query)) intents.push("REQUIRES");
+  if (/证明|佐证|支撑|材料|依据|为什么|链路/.test(query)) intents.push("PROVES");
+  if (/满足|符合|响应|怎么响应|匹配/.test(query)) intents.push("SATISFIES");
+  if (/持有|具备|人员|证书/.test(query)) intents.push("HOLDS");
+  if (/业绩|案例|经验|项目类型/.test(query)) intents.push("HAS_EXPERIENCE", "MATCHES_TYPE");
+  if (/评分|得分|加分/.test(query)) intents.push("SCORES_FOR");
+  if (/废标|无效|风险|扣分/.test(query)) intents.push("CAUSES_RISK");
+  if (/提交|递交|提供|响应文件/.test(query)) intents.push("SUBMITS");
+  return normalizeRelationTypes(intents);
+}
+
+function normalizeRelationTypes(types: string[]): string[] {
+  return unique(types.map((type) => normalizeRelation(type).type)).filter((type) => type !== "RELATED_TO");
+}
+
+function mergeGraphSections(
+  sections: SearchSection[],
+  graphSections: Array<SearchSection & { edgeId?: string }>,
+  maxSections: number
+) {
+  const seen = new Set(sections.map((section) => section.chunkId));
+  for (const section of graphSections) {
+    if (seen.has(section.chunkId)) continue;
+    sections.unshift({
+      chunkId: section.chunkId,
+      sourceId: section.sourceId,
+      documentId: section.documentId,
+      externalId: section.externalId,
+      documentTitle: section.documentTitle,
+      documentMetadata: section.documentMetadata,
+      heading: section.heading,
+      content: section.content,
+      rank: section.rank,
+      score: Math.max(section.score ?? 0, 0.75)
+    });
+    seen.add(section.chunkId);
+    if (sections.length >= maxSections) {
+      return;
+    }
+  }
+}
+
+function attachWhyToSections(input: {
+  sections: SearchSection[];
+  recalledEntities: EntityRecord[];
+  recalledEdges: NonNullable<SearchTrace["recalledEdges"]>;
+  graphPaths: NonNullable<SearchTrace["graphPaths"]>;
+  edgesForSections: NonNullable<SearchTrace["recalledEdges"]>;
+  fallback: boolean;
+}): SearchSection[] {
+  const edgesByChunk = new Map<string, typeof input.edgesForSections>();
+  for (const edge of input.edgesForSections) {
+    if (!edge.chunkId) continue;
+    const list = edgesByChunk.get(edge.chunkId) ?? [];
+    list.push(edge);
+    edgesByChunk.set(edge.chunkId, list);
+  }
+  return input.sections.map((section) => {
+    const sectionEdges = edgesByChunk.get(section.chunkId) ?? [];
+    const pathEdges = new Set(sectionEdges.map((edge) => edge.id));
+    const graphPaths = input.graphPaths.filter((path) => path.edges.some((edge) => pathEdges.has(edge.id)));
+    const matchedEdges = sectionEdges.length > 0 ? sectionEdges : input.recalledEdges.filter((edge) => edge.chunkId === section.chunkId);
+    const recallType: SearchResultWhy["recallType"] = graphPaths.length > 0
+      ? "graph_path"
+      : matchedEdges.length > 0
+        ? "knowledge_edge"
+        : input.recalledEntities.length > 0
+          ? "entity"
+          : input.fallback
+            ? "fallback"
+            : "vector";
+    return {
+      ...section,
+      why: {
+        matchedEntities: input.recalledEntities.map((entity) => ({
+          id: entity.id,
+          name: entity.name,
+          type: entity.type,
+          score: entity.score
+        })),
+        matchedEdges,
+        graphPaths,
+        evidence: uniqueEvidence([
+          ...matchedEdges.map((edge) => ({ edgeId: edge.id, chunkId: edge.chunkId ?? undefined, text: edge.evidence ?? "", score: edge.qualityScore ?? edge.confidence })),
+          ...graphPaths.flatMap((path) => path.evidence.map((item) => ({ edgeId: item.edgeId, chunkId: section.chunkId, text: item.text, score: item.confidence })))
+        ]),
+        recallType,
+        fallback: input.fallback || recallType === "fallback"
+      }
+    };
+  });
+}
+
+function uniqueEvidence(items: Array<{ edgeId?: string; chunkId?: string; text: string; score?: number }>): Array<{ edgeId?: string; chunkId?: string; text: string; score?: number }> {
+  const seen = new Set<string>();
+  const result: Array<{ edgeId?: string; chunkId?: string; text: string; score?: number }> = [];
+  for (const item of items) {
+    const text = item.text.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push({ ...item, text });
+  }
+  return result.slice(0, 6);
+}
+
+function buildExpandedTextQuery(query: string, entities: string[]): string {
+  return unique([query, ...entities]).join(" ");
 }
 
 async function timed<T>(

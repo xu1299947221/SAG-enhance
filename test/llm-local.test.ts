@@ -68,6 +68,21 @@ describe("local LLM fallback", () => {
     expect(events[0].entities.length).toBeGreaterThan(0);
   });
 
+  it("does not use generic Introduction headings as event titles", async () => {
+    const client = new OpenAICompatibleLlmClient();
+    const events = await client.extractEventsFromChunk({
+      title: "操作手册",
+      heading: "Introduction",
+      content: "烽觅智能 AI 预审助手支持知识库管理、文件上传和智能预审。",
+      references: ["00000000-0000-0000-0000-000000000010"]
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].title).not.toBe("Introduction");
+    expect(events[0].title).toContain("烽觅智能");
+  });
+
+
   it("keeps Chinese fallback extraction in Chinese", async () => {
     const client = new OpenAICompatibleLlmClient();
     const events = await client.extractEventsFromChunk({
@@ -81,6 +96,24 @@ describe("local LLM fallback", () => {
     expect(events[0].category).toBe("一般事项");
     expect(events[0].entities.length).toBeGreaterThan(0);
     expect(events[0].entities.every((entity) => !entity.description.includes("Mentioned in event"))).toBe(true);
+  });
+
+  it("enriches local Chinese bidding extraction with bid-domain entities", async () => {
+    const client = new OpenAICompatibleLlmClient();
+    const events = await client.extractEventsFromChunk({
+      title: "招标文件",
+      heading: "评分和资格要求",
+      content: "供应商需要提供项目人员证书、类似业绩证明材料，并响应评分标准中的技术评分要求。",
+      references: ["00000000-0000-0000-0000-000000000003"]
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].entities.map((entity) => entity.name)).toEqual(expect.arrayContaining([
+      "类似业绩证明材料",
+      "证明材料",
+      "评分标准",
+      "技术评分"
+    ]));
   });
 
   it("normalizes remote extraction to one event when the model returns multiple items", async () => {
@@ -150,7 +183,7 @@ describe("local LLM fallback", () => {
     expect(events[0].content).toContain("SAG系统接入MCP工具。");
     expect(events[0].content).toContain("SAG系统生成Embedding向量。");
     expect(events[0].keywords).toEqual(["SAG系统", "PostgreSQL", "MCP工具", "Embedding"]);
-    expect(events[0].entities.map((entity) => entity.name)).toEqual(["SAG系统", "MCP工具", "Embedding"]);
+    expect(events[0].entities.map((entity) => entity.name)).toEqual(expect.arrayContaining(["SAG系统", "MCP工具", "Embedding"]));
   });
 
   it("falls back when remote extraction changes Chinese content into English", async () => {

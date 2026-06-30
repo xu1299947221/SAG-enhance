@@ -104,12 +104,11 @@ SAG 提供两种模式：
 
 你需要：
 
-- Node.js 20 或更高版本
-- npm
-- PostgreSQL
-- pgvector
+- 开发环境：Node.js 20 或更高版本、npm
+- 生产环境：Docker / Docker Compose 即可，Node 运行时会打进 SAG 应用镜像
+- 数据库：PostgreSQL + pgvector，由 compose 里的 `pgvector/pgvector:pg16` 容器提供
 
-如果你只是想最快跑起来，推荐用 Docker 启动 PostgreSQL。
+开发时推荐用 Docker 启动 PostgreSQL。
 
 ### 2. 克隆项目
 
@@ -128,7 +127,7 @@ cp .env.example .env
 
 ### 4. 启动 PostgreSQL
 
-使用 Docker：
+开发 PostgreSQL：
 
 ```bash
 docker compose up -d
@@ -172,6 +171,8 @@ API:   http://localhost:4173
 
 ### 7. 构建并启动生产服务
 
+本机有 Node 时可以这样测试生产构建：
+
 ```bash
 npm run build
 npm start
@@ -182,6 +183,33 @@ npm start
 ```text
 http://localhost:4173
 ```
+
+生产机器不需要 Node.js，直接用生产容器：
+
+```bash
+# 第一次部署前准备宿主机数据目录。目录会保存 PostgreSQL 数据。
+mkdir -p ./data/postgres
+
+# 构建 SAG 应用镜像并启动 PostgreSQL。
+docker compose -f docker-compose.prod.yml up -d --build postgres
+
+# 初始化/迁移数据库，并写入默认实体类型。
+docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
+docker compose -f docker-compose.prod.yml --profile tools run --rm seed
+
+# 启动 SAG 应用容器。
+docker compose -f docker-compose.prod.yml up -d app
+```
+
+生产 compose 不会把 PostgreSQL 端口暴露到宿主机。WebUI 和 API 都由 `app` 容器在同一个端口提供。默认绑定 `127.0.0.1:4173`；只有明确需要让宿主机网卡对外提供访问时，才设置 `SAG_APP_BIND=0.0.0.0`。
+
+数据目录默认映射到宿主机 `./data/postgres`，可以通过环境变量改到独立磁盘目录：
+
+```bash
+SAG_PG_DATA_DIR=/data/sag/postgres docker compose -f docker-compose.prod.yml up -d postgres
+```
+
+开发环境的 PostgreSQL 数据默认在 `./data/dev-postgres`，可用 `SAG_DEV_PG_DATA_DIR` 修改。`data/` 已加入 `.gitignore` 和 `.dockerignore`，不要提交数据库文件。
 
 ## 第一次怎么用
 
@@ -280,6 +308,41 @@ curl -X POST http://localhost:4173/ingest \
   -d '{"sourceId":"项目ID","title":"Demo","content":"# Demo\n\nSAG 可以检索项目文档。","extract":true}'
 ```
 
+外部系统同步素材时，建议传 `externalId` 保存自己的素材/文件 ID，并开启 `replaceExisting`。同一个 `sourceId + externalId` 重复同步时，SAG 会先删除旧文档及其切片、事件、实体关系，再重建索引：
+
+```bash
+curl -X POST http://localhost:4173/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sourceId":"项目ID",
+    "externalId":"业务系统resource_id",
+    "title":"注册信息安全工程师证书-熊巍",
+    "content":"业务系统已经解析好的 Markdown 或纯文本",
+    "metadata":{"sourceSystem":"ragyuyan","assetType":"certificate"},
+    "extract":true,
+    "replaceExisting":true
+  }'
+```
+
+批量同步：
+
+```bash
+curl -X POST http://localhost:4173/ingest/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "continueOnError": true,
+    "documents": [
+      {
+        "sourceId":"项目ID",
+        "externalId":"resource_1",
+        "title":"素材1",
+        "content":"素材1正文",
+        "replaceExisting":true
+      }
+    ]
+  }'
+```
+
 执行检索：
 
 ```bash
@@ -287,6 +350,8 @@ curl -X POST http://localhost:4173/api/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"SAG 为什么适合多跳检索？","sourceIds":["项目ID"],"strategy":"multi","searchMode":"fast","topK":5,"returnTrace":true}'
 ```
+
+检索结果的 `sections[]` 会返回 `externalId`、`documentTitle`、`documentMetadata`。外部系统可直接用 `externalId` 映射回自己的素材 `resource_id`。
 
 流式检索过程：
 

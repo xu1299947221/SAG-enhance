@@ -1,6 +1,9 @@
 import { aiSettingsService, type AiRuntimeSettings } from "../services/ai-settings-service.js";
 import type { ExtractedEntity, ExtractedEvent, EventRecord } from "../types.js";
 import { createModelCallLogger } from "../observability/model-call-log.js";
+import { biddingCanonicalEntities, biddingEntityTypes, extractBiddingDomainEntities, inferBiddingEntityType } from "../domain/bidding-domain.js";
+import { enrichEntitiesWithDiscoveredObjects } from "../domain/domain-object-discovery.js";
+import { cleanExtractedEntities } from "../domain/entity-cleaning.js";
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -28,19 +31,29 @@ export class OpenAICompatibleLlmClient implements LlmClient {
         operation: "extractNamedEntities.local",
         request: { query }
       });
-      const entities = localNamedEntities(query);
+      const entities = uniqueStrings([
+        ...extractBiddingDomainEntities(query, settings.biddingDomainConfig),
+        ...localNamedEntities(query)
+      ]);
       log.succeed({ named_entities: entities });
       return entities;
     }
     const result = await this.chatJson(settings, {
-      system: "Extract named entities important for answering the question. Return JSON only.",
+      system: [
+        "Extract named entities important for answering the question. Return JSON only.",
+        `For Chinese bidding/procurement questions, prefer canonical bid entities: ${biddingCanonicalEntities(settings.biddingDomainConfig).join(", ")}.`,
+        "Keep entities concise and reusable; do not return long sentence fragments."
+      ].join("\n"),
       user: JSON.stringify({
         question: query,
         schema: { named_entities: ["string"] }
       })
     });
     const entities = Array.isArray(result.named_entities) ? result.named_entities : result.entities;
-    return Array.isArray(entities) ? entities.map(String).filter(Boolean) : localNamedEntities(query);
+    return uniqueStrings([
+      ...extractBiddingDomainEntities(query, settings.biddingDomainConfig),
+      ...(Array.isArray(entities) ? entities.map(String).filter(Boolean) : localNamedEntities(query))
+    ]);
   }
 
   async extractEventsFromChunk(input: {
@@ -62,14 +75,14 @@ export class OpenAICompatibleLlmClient implements LlmClient {
     }
     const result = await this.chatJson(settings, {
       operation: "extractEventsFromChunk.benchmarkPipeline",
-      messages: buildBenchmarkExtractionMessages(input)
+      messages: buildBenchmarkExtractionMessages(input, settings)
     });
     const items = Array.isArray(result.items) ? result.items : result.data?.items;
     if (!Array.isArray(items) || items.length === 0) {
       return [localExtractEvent(input)];
     }
     const inputIsChinese = isMostlyChinese(input.content);
-    const event = buildSingleExtractedEvent(items, input, inputIsChinese);
+    const event = buildSingleExtractedEvent(items, input, inputIsChinese, settings.biddingDomainConfig);
     return event ? [event] : [localExtractEvent(input)];
   }
 
@@ -246,7 +259,8 @@ function buildBenchmarkExtractionMessages(input: {
   heading?: string;
   content: string;
   references: string[];
-}): ChatMessage[] {
+}, settings?: AiRuntimeSettings): ChatMessage[] {
+  const domainConfig = settings?.biddingDomainConfig;
   const userInput = {
     type: "request",
     data: {
@@ -263,21 +277,21 @@ function buildBenchmarkExtractionMessages(input: {
         source_summary: "",
         previous_context: "",
         related_events: [],
-        entity_types: benchmarkEntityTypes(),
+        entity_types: benchmarkEntityTypes(domainConfig),
         output_language: "Use the same main language as the input text. Chinese input must produce Chinese fields; English input must produce English fields."
       }
     },
-    output_schema: benchmarkExtractionSchema()
+    output_schema: benchmarkExtractionSchema(domainConfig)
   };
   return [
     { role: "system", content: buildBenchmarkExtractionSystemPrompt() },
-    { role: "user", content: JSON.stringify(benchmarkExtractionExampleInput()) },
+    { role: "user", content: JSON.stringify(benchmarkExtractionExampleInput(domainConfig)) },
     { role: "assistant", content: JSON.stringify(benchmarkExtractionExampleOutput()) },
     { role: "user", content: JSON.stringify(userInput) }
   ];
 }
 
-function benchmarkEntityTypes() {
+function benchmarkEntityTypes(domainConfig?: AiRuntimeSettings["biddingDomainConfig"]) {
   return [
     { type: "person", description: "人物、作者、用户、负责人等具体个人" },
     { type: "organization", description: "公司、机构、团体、政府部门、学校、团队等组织" },
@@ -288,12 +302,13 @@ function benchmarkEntityTypes() {
     { type: "action", description: "动作、行为、流程、操作、状态变化" },
     { type: "work", description: "作品、文档、论文、项目、任务、计划" },
     { type: "group", description: "人群、角色群体、职业群体、用户群体" },
+    ...biddingEntityTypes(domainConfig),
     { type: "subject", description: "主题、概念、领域、技术、专业术语、事件名称" },
     { type: "tags", description: "其他类型均不匹配时使用的标签实体" }
   ];
 }
 
-function benchmarkExtractionExampleInput() {
+function benchmarkExtractionExampleInput(domainConfig?: AiRuntimeSettings["biddingDomainConfig"]) {
   return {
     type: "request",
     data: {
@@ -307,10 +322,10 @@ function benchmarkExtractionExampleInput() {
         source_summary: "",
         previous_context: "",
         related_events: [],
-        entity_types: benchmarkEntityTypes()
+        entity_types: benchmarkEntityTypes(domainConfig)
       }
     },
-    output_schema: benchmarkExtractionSchema()
+    output_schema: benchmarkExtractionSchema(domainConfig)
   };
 }
 
@@ -343,7 +358,7 @@ function benchmarkExtractionExampleOutput() {
   };
 }
 
-function benchmarkExtractionSchema() {
+function benchmarkExtractionSchema(domainConfig?: AiRuntimeSettings["biddingDomainConfig"]) {
   return {
     type: "object",
     required: ["type", "data"],
@@ -375,7 +390,7 @@ function benchmarkExtractionSchema() {
                     type: "object",
                     required: ["type", "name", "description"],
                     properties: {
-                      type: { enum: benchmarkEntityTypes().map((entityType) => entityType.type) },
+                      type: { enum: benchmarkEntityTypes(domainConfig).map((entityType) => entityType.type) },
                       name: { type: "string" },
                       description: { type: "string" }
                     }
@@ -423,6 +438,16 @@ You are a professional SAG content extractor. Extract exactly two structured obj
 - Split coordinated entities such as "A and B" into separate entities.
 - Use only the provided entity_types. Prefer specific types; use tags only when no specific type fits.
 - Each entity.description must explain that entity's concrete role or relationship in the event.
+
+## Chinese Bidding/Procurement Adaptation
+
+When the input is a Chinese 招标文件、采购文件、磋商文件、投标/响应文件, treat it as intelligent-bidding material:
+
+- Prefer bid-domain entities over generic fragments. Use canonical names such as "供应商资格条件", "类似业绩要求", "项目负责人要求", "人员证书要求", "评分标准", "无效响应条款", "付款方式", "服务期限", "验收要求", "质保期", "证明材料".
+- Extract relationships that matter for response writing: who must satisfy a requirement, what certificate/performance/material is required, what time or amount limit applies, what project type is referenced, what clause causes invalid response, and what scoring item it affects.
+- Do not create vague broken names like "投标人拟派本项目的项目" or "具有履行合同所必需的设备和专业技术". Rewrite them to concise reusable entities, for example "拟派项目负责人", "履约设备和专业技术能力证明".
+- Event title/category should expose the bidding purpose, for example "供应商资格审查要求", "项目团队人员与证书要求", "类似业绩评分规则", "无效响应情形".
+- The event content should preserve clause logic across nearby paragraphs: condition, object, evidence material, threshold/time/amount, consequence.
 
 ## Input Contract
 
@@ -473,7 +498,11 @@ The response must be:
 `.trim();
 }
 
-function normalizeEntities(raw: unknown, inputIsChinese: boolean): ExtractedEntity[] {
+function normalizeEntities(
+  raw: unknown,
+  inputIsChinese: boolean,
+  domainConfig?: AiRuntimeSettings["biddingDomainConfig"]
+): ExtractedEntity[] {
   if (!Array.isArray(raw)) {
     return [];
   }
@@ -483,7 +512,7 @@ function normalizeEntities(raw: unknown, inputIsChinese: boolean): ExtractedEnti
       const name = String(record.name ?? "").trim();
       const description = String(record.description ?? "").trim();
       return {
-        type: normalizeEntityType(String(record.type ?? "subject")),
+        type: normalizeEntityType(String(record.type ?? "subject"), domainConfig),
         name,
         description: normalizeEntityDescription(description, inputIsChinese)
       };
@@ -511,7 +540,8 @@ function collectValidEventItems(items: unknown[]): Array<Record<string, unknown>
 function buildSingleExtractedEvent(
   items: unknown[],
   input: { title: string; heading?: string; content: string; references: string[] },
-  inputIsChinese: boolean
+  inputIsChinese: boolean,
+  domainConfig?: AiRuntimeSettings["biddingDomainConfig"]
 ): ExtractedEvent | null {
   const eventItems = collectValidEventItems(items);
   if (eventItems.length === 0) {
@@ -526,8 +556,21 @@ function buildSingleExtractedEvent(
   const keywords = uniqueStrings(
     eventItems.flatMap((item) => Array.isArray(item.keywords) ? item.keywords.map(String) : [])
   );
-  const entities = uniqueEntities(eventItems.flatMap((item) => normalizeEntities(item.entities, inputIsChinese)));
-  const title = normalizeEventText(String(primary.title ?? ""), input.heading ?? input.title, inputIsChinese);
+  const discoveredEntities = cleanExtractedEntities(enrichEntitiesWithDiscoveredObjects(
+    uniqueEntities(eventItems.flatMap((item) => normalizeEntities(item.entities, inputIsChinese, domainConfig))),
+    input.content,
+    24
+  ), { text: input.content, inputIsChinese, limit: 24 });
+  const entities = cleanExtractedEntities(
+    enrichWithBiddingDomainEntities(discoveredEntities, input.content, inputIsChinese, domainConfig),
+    {
+      text: input.content,
+      inputIsChinese,
+      preserveNames: extractBiddingDomainEntities(input.content, domainConfig, { includeExpansions: false }),
+      limit: 24
+    }
+  );
+  const title = normalizeEventTitle(String(primary.title ?? ""), input, content, inputIsChinese);
   const summary = normalizeEventText(String(primary.summary ?? ""), title, inputIsChinese);
   const category = normalizeCategory(primary.category, inputIsChinese);
 
@@ -548,6 +591,52 @@ function normalizeEventText(value: string, fallback: string, inputIsChinese: boo
     return fallback;
   }
   return text;
+}
+
+function normalizeEventTitle(
+  value: string,
+  input: { title: string; heading?: string; content: string },
+  eventContent: string,
+  inputIsChinese: boolean
+): string {
+  const candidates = [
+    value,
+    input.heading,
+    firstSentence(eventContent),
+    firstSentence(input.content),
+    input.title
+  ];
+  for (const candidate of candidates) {
+    const title = cleanTitle(candidate ?? "");
+    if (!title || isGenericEventTitle(title) || isLikelyLanguageDrift(title, inputIsChinese)) {
+      continue;
+    }
+    return conciseTitle(title, inputIsChinese);
+  }
+  return inputIsChinese ? "文档事项" : "Document event";
+}
+
+function enrichWithBiddingDomainEntities(
+  entities: ExtractedEntity[],
+  content: string,
+  inputIsChinese: boolean,
+  domainConfig?: AiRuntimeSettings["biddingDomainConfig"]
+): ExtractedEntity[] {
+  const existing = new Set(entities.map((entity) => entity.name.trim().toLowerCase()));
+  const enriched = [...entities];
+  for (const name of extractBiddingDomainEntities(content, domainConfig, { includeExpansions: false })) {
+    const key = name.toLowerCase();
+    if (existing.has(key)) {
+      continue;
+    }
+    existing.add(key);
+    enriched.push({
+      type: normalizeEntityType(inferBiddingEntityType(name, domainConfig) ?? "subject", domainConfig),
+      name,
+      description: inputIsChinese ? `从应标领域词表和原文命中补充的实体：${name}` : `Bid-domain entity matched from content: ${name}`
+    });
+  }
+  return enriched.slice(0, 24);
 }
 
 function normalizeCategory(value: unknown, inputIsChinese: boolean): string {
@@ -634,13 +723,24 @@ function localExtractEvent(input: {
   references: string[];
 }): ExtractedEvent {
   const zh = isMostlyChinese(input.content);
-  const title = cleanTitle(input.heading || firstSentence(input.content) || input.title);
+  const title = normalizeEventTitle("", input, input.content, zh);
   const keywords = localKeywords(`${title} ${input.content}`);
-  const entities = localNamedEntities(`${title} ${input.content}`).slice(0, 12).map((name) => ({
+  const baseEntities = localNamedEntities(`${title} ${input.content}`).slice(0, 12).map((name) => ({
     type: inferEntityType(name),
     name,
     description: zh ? `在事项「${title}」中被提及` : `Mentioned in event: ${title}`
   }));
+  const discoveredEntities = enrichEntitiesWithDiscoveredObjects(baseEntities, `${title} ${input.content}`, 24);
+  const text = `${title} ${input.content}`;
+  const entities = cleanExtractedEntities(
+    enrichWithBiddingDomainEntities(discoveredEntities, text, zh),
+    {
+      text,
+      inputIsChinese: zh,
+      preserveNames: extractBiddingDomainEntities(text, undefined, { includeExpansions: false }),
+      limit: 24
+    }
+  );
   return {
     title,
     summary: conciseText(firstSentence(input.content) || title, zh),
@@ -715,6 +815,35 @@ function cleanTitle(text: string): string {
   return text.replace(/^#+\s*/, "").trim().slice(0, 160) || "Untitled event";
 }
 
+function isGenericEventTitle(title: string): boolean {
+  const normalized = title.trim().toLowerCase();
+  if (/^\d+[.．、)]?$/.test(normalized)) {
+    return true;
+  }
+  return [
+    "introduction",
+    "untitled",
+    "untitled event",
+    "general",
+    "正文",
+    "文档",
+    "内容",
+    "首页"
+  ].includes(normalized);
+}
+
+function conciseTitle(title: string, inputIsChinese: boolean): string {
+  const cleaned = title
+    .replace(/\[图片\]/g, " ")
+    .replace(/blob:file:\/\/\/[A-Za-z0-9._-]+/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/^(首页|返回|当前位置)[\s：:]+/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const maxLength = inputIsChinese ? 32 : 80;
+  return cleaned.length > maxLength ? cleaned.slice(0, maxLength).trim() : cleaned;
+}
+
 function isMostlyChinese(text: string): boolean {
   const cjkChars = text.match(/[\u4e00-\u9fa5]/g)?.length ?? 0;
   const latinWords = text.match(/[A-Za-z]{2,}/g)?.length ?? 0;
@@ -731,6 +860,8 @@ function isLikelyLanguageDrift(text: string, inputIsChinese: boolean): boolean {
 }
 
 function inferEntityType(name: string): string {
+  const biddingType = inferBiddingEntityType(name);
+  if (biddingType) return biddingType;
   if (/\d/.test(name)) return "metric";
   if (/(Inc|Corp|LLC|Ltd|Company|Group|公司|集团|大学|组织)$/i.test(name)) return "organization";
   if (/(System|Platform|Product|系统|平台|产品|模型|数据库)$/i.test(name)) return "product";
@@ -738,8 +869,8 @@ function inferEntityType(name: string): string {
   return "subject";
 }
 
-function normalizeEntityType(type: string): string {
-  const allowed = new Set(["time", "location", "person", "organization", "subject", "product", "metric", "action", "work", "group", "tags"]);
+function normalizeEntityType(type: string, domainConfig?: AiRuntimeSettings["biddingDomainConfig"]): string {
+  const allowed = new Set(benchmarkEntityTypes(domainConfig).map((entityType) => entityType.type));
   return allowed.has(type) ? type : "subject";
 }
 

@@ -11,8 +11,20 @@ import { logger } from "../observability/logger.js";
 import { webuiService } from "../services/webui-service.js";
 import { mcpAgentService } from "../services/mcp-agent-service.js";
 import { aiSettingsService } from "../services/ai-settings-service.js";
+import { milvusMarkdownImportService } from "../services/milvus-markdown-import-service.js";
+import { biddingDomainAnalysisService } from "../services/bidding-domain-analysis-service.js";
+import { relationRebuildService } from "../services/relation-rebuild-service.js";
 import { getPublicMcpSettings } from "../services/mcp-settings-service.js";
 import { listModelCallLogs } from "../observability/model-call-log.js";
+import { DEFAULT_RELATIONS, normalizeRelation } from "../domain/relation-ontology.js";
+import {
+  getRelationConfig,
+  getRelationStats,
+  listKnowledgeEdgesByDocument,
+  listKnowledgeEdgesBySource,
+  updateKnowledgeEdge,
+  upsertRelationConfig
+} from "../db/repositories.js";
 
 const rootDir = process.cwd();
 const webDistDir = path.join(rootDir, "web", "dist");
@@ -20,16 +32,43 @@ const webIndexFile = path.join(webDistDir, "index.html");
 
 const ingestSchema = z.object({
   sourceId: z.string().uuid().optional(),
+  externalId: z.string().min(1).max(256).optional(),
   title: z.string().min(1),
   content: z.string().min(1),
   metadata: z.record(z.unknown()).optional(),
   extract: z.boolean().optional(),
+  replaceExisting: z.boolean().optional(),
   waitForCompletion: z.boolean().optional(),
   chunking: z.object({
     mode: z.enum(["heading_strict", "token"]).optional(),
     maxTokens: z.number().int().min(64).max(8192).optional(),
     overlapTokens: z.number().int().min(0).max(4096).optional()
   }).optional()
+});
+
+const batchIngestSchema = z.object({
+  documents: z.array(ingestSchema).min(1).max(100),
+  continueOnError: z.boolean().optional()
+});
+
+const milvusMarkdownImportSchema = z.object({
+  connection: z.object({
+    address: z.string().min(1),
+    username: z.string().optional(),
+    password: z.string().optional(),
+    database: z.string().optional()
+  }),
+  collectionName: z.string().min(1),
+  sourceId: z.string().uuid().optional(),
+  filter: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  offset: z.number().int().min(0).max(10_000).optional(),
+  idField: z.string().min(1).max(64).optional(),
+  titleField: z.string().min(1).max(64).optional(),
+  markdownUrlField: z.string().min(1).max(64).optional(),
+  extract: z.boolean().optional(),
+  replaceExisting: z.boolean().optional(),
+  continueOnError: z.boolean().optional()
 });
 
 const searchSchema = z.object({
@@ -40,6 +79,9 @@ const searchSchema = z.object({
   subStrategy: z.enum(["multi", "multi1", "hopllm"]).optional(),
   topK: z.number().int().positive().max(50).optional(),
   returnTrace: z.boolean().optional(),
+  useGraphPaths: z.boolean().optional(),
+  relationTypes: z.array(z.string().min(1)).optional(),
+  minEdgeConfidence: z.number().min(0).max(1).optional(),
   multi: z.object({
     entityTopK: z.number().int().positive().optional(),
     multiTopK: z.number().int().positive().optional(),
@@ -53,6 +95,32 @@ const searchSchema = z.object({
     rerankTopK: z.number().int().positive().max(20).optional(),
     maxSections: z.number().int().positive().max(50).optional()
   }).optional()
+});
+
+const relationConfigSchema = z.object({
+  disabledRelations: z.array(z.string().min(1)).optional(),
+  relationAliases: z.record(z.array(z.string())).optional(),
+  entityAliases: z.record(z.string()).optional(),
+  minConfidence: z.record(z.number().min(0).max(1)).optional(),
+  customRelations: z.array(z.unknown()).optional(),
+  metadata: z.record(z.unknown()).optional()
+});
+
+const relationUpdateSchema = z.object({
+  relationType: z.string().min(1).optional(),
+  relationLabel: z.string().min(1).optional(),
+  subjectName: z.string().min(1).optional(),
+  objectName: z.string().min(1).optional(),
+  evidence: z.string().optional().nullable(),
+  confidence: z.number().min(0).max(1).optional(),
+  qualityScore: z.number().min(0).max(1).optional(),
+  status: z.enum(["AUTO", "CONFIRMED", "REJECTED", "DISABLED"]).optional(),
+  metadata: z.record(z.unknown()).optional(),
+  note: z.string().optional()
+});
+
+const relationRebuildSchema = z.object({
+  sourceId: z.string().uuid()
 });
 
 const uploadSchema = z.object({
@@ -101,13 +169,16 @@ const aiSettingsSchema = z.object({
   llmModel: z.string().min(1),
   llmApiKey: z.string().optional(),
   clearLlmApiKey: z.boolean().optional(),
+  rerankModel: z.string().min(1),
+  rerankInstruct: z.string().min(1),
   llmTimeoutMs: z.number().int().positive(),
   llmMaxRetries: z.number().int().min(0).max(10),
   defaultSearchMode: z.enum(["standard", "fast"]).default("fast"),
   defaultSearchTopK: z.number().int().min(1).max(50).default(10),
   defaultChunkingMode: z.enum(["heading_strict", "token"]).default("heading_strict"),
   chunkTokenLimit: z.number().int().min(64).max(8192).default(512),
-  chunkOverlapTokens: z.number().int().min(0).max(4096).default(100)
+  chunkOverlapTokens: z.number().int().min(0).max(4096).default(100),
+  biddingDomainConfig: z.unknown().optional()
 });
 
 export function buildHttpServer() {
@@ -246,6 +317,61 @@ export function buildHttpServer() {
     };
   });
 
+  app.get("/api/relation-ontology", async () => ({
+    ontology: {
+      relations: DEFAULT_RELATIONS
+    }
+  }));
+
+  app.get("/api/projects/:projectId/relations", async (request) => {
+    const params = request.params as { projectId: string };
+    const query = request.query as { includeInactive?: string; limit?: string };
+    z.string().uuid().parse(params.projectId);
+    return {
+      relations: await listKnowledgeEdgesBySource({
+        sourceId: params.projectId,
+        tenantId: config.DEFAULT_TENANT_ID,
+        includeInactive: query.includeInactive === "true",
+        limit: query.limit ? Number(query.limit) : undefined
+      })
+    };
+  });
+
+  app.get("/api/projects/:projectId/relations/stats", async (request) => {
+    const params = request.params as { projectId: string };
+    z.string().uuid().parse(params.projectId);
+    return {
+      stats: await getRelationStats({
+        sourceId: params.projectId,
+        tenantId: config.DEFAULT_TENANT_ID
+      })
+    };
+  });
+
+  app.get("/api/projects/:projectId/relation-config", async (request) => {
+    const params = request.params as { projectId: string };
+    z.string().uuid().parse(params.projectId);
+    return {
+      config: await getRelationConfig({
+        sourceId: params.projectId,
+        tenantId: config.DEFAULT_TENANT_ID
+      })
+    };
+  });
+
+  app.patch("/api/projects/:projectId/relation-config", async (request) => {
+    const params = request.params as { projectId: string };
+    z.string().uuid().parse(params.projectId);
+    const input = relationConfigSchema.parse(request.body);
+    return {
+      config: await upsertRelationConfig({
+        sourceId: params.projectId,
+        tenantId: config.DEFAULT_TENANT_ID,
+        ...input
+      })
+    };
+  });
+
   app.post("/api/documents/upload", async (request, reply) => {
     const input = uploadSchema.parse(request.body);
     const result = await webuiService.uploadDocument(input);
@@ -342,10 +468,111 @@ export function buildHttpServer() {
     };
   });
 
+  app.get("/api/documents/:documentId/relations", async (request) => {
+    const params = request.params as { documentId: string };
+    const query = request.query as { includeInactive?: string };
+    z.string().uuid().parse(params.documentId);
+    return {
+      relations: await listKnowledgeEdgesByDocument({
+        documentId: params.documentId,
+        tenantId: config.DEFAULT_TENANT_ID,
+        includeInactive: query.includeInactive === "true"
+      })
+    };
+  });
+
+  app.patch("/api/relations/:edgeId", async (request, reply) => {
+    const params = request.params as { edgeId: string };
+    z.string().uuid().parse(params.edgeId);
+    const input = relationUpdateSchema.parse(request.body);
+    const normalized = input.relationType ? normalizeRelation(input.relationType) : null;
+    const relation = await updateKnowledgeEdge({
+      edgeId: params.edgeId,
+      tenantId: config.DEFAULT_TENANT_ID,
+      ...input,
+      ...(normalized ? {
+        relationType: normalized.type,
+        relationLabel: input.relationLabel ?? normalized.label
+      } : {})
+    });
+    if (!relation) {
+      return reply.code(404).send(notFound("RELATION_NOT_FOUND", "关系边不存在"));
+    }
+    return { relation };
+  });
+
+  app.post("/api/relations/:edgeId/confirm", async (request, reply) => {
+    const params = request.params as { edgeId: string };
+    z.string().uuid().parse(params.edgeId);
+    const relation = await updateKnowledgeEdge({
+      edgeId: params.edgeId,
+      tenantId: config.DEFAULT_TENANT_ID,
+      status: "CONFIRMED",
+      note: "confirmed via api"
+    });
+    if (!relation) return reply.code(404).send(notFound("RELATION_NOT_FOUND", "关系边不存在"));
+    return { relation };
+  });
+
+  app.post("/api/relations/:edgeId/reject", async (request, reply) => {
+    const params = request.params as { edgeId: string };
+    z.string().uuid().parse(params.edgeId);
+    const relation = await updateKnowledgeEdge({
+      edgeId: params.edgeId,
+      tenantId: config.DEFAULT_TENANT_ID,
+      status: "REJECTED",
+      note: "rejected via api"
+    });
+    if (!relation) return reply.code(404).send(notFound("RELATION_NOT_FOUND", "关系边不存在"));
+    return { relation };
+  });
+
+  app.post("/api/relations/:edgeId/disable", async (request, reply) => {
+    const params = request.params as { edgeId: string };
+    z.string().uuid().parse(params.edgeId);
+    const relation = await updateKnowledgeEdge({
+      edgeId: params.edgeId,
+      tenantId: config.DEFAULT_TENANT_ID,
+      status: "DISABLED",
+      note: "disabled via api"
+    });
+    if (!relation) return reply.code(404).send(notFound("RELATION_NOT_FOUND", "关系边不存在"));
+    return { relation };
+  });
+
+  app.post("/api/relations/rebuild", async (request, reply) => {
+    const input = relationRebuildSchema.parse(request.body);
+    const result = await relationRebuildService.rebuildSource(input.sourceId);
+    return reply.code(result.failed > 0 ? 207 : 200).send(result);
+  });
+
   app.post("/ingest", async (request, reply) => {
     const input = ingestSchema.parse(request.body);
     const result = await ingestionService.ingestDocument(input);
     return reply.code(201).send(result);
+  });
+
+  app.post("/ingest/batch", async (request, reply) => {
+    const input = batchIngestSchema.parse(request.body);
+    const result = await ingestionService.ingestDocuments(input);
+    return reply.code(result.failed > 0 ? 207 : 201).send(result);
+  });
+
+  app.post("/api/debug/import/milvus-markdown", async (request, reply) => {
+    const input = milvusMarkdownImportSchema.parse(request.body);
+    const result = await milvusMarkdownImportService.importDocuments(input);
+    return reply.code(result.failed > 0 ? 207 : 201).send(result);
+  });
+
+  app.post("/api/debug/preview/milvus-markdown", async (request) => {
+    const input = milvusMarkdownImportSchema.parse(request.body);
+    return milvusMarkdownImportService.previewDocuments(input);
+  });
+
+  app.get("/api/debug/projects/:projectId/bidding-domain-analysis", async (request) => {
+    const params = request.params as { projectId: string };
+    z.string().uuid().parse(params.projectId);
+    return biddingDomainAnalysisService.analyzeSource(params.projectId);
   });
 
   app.post("/search", async (request) => {

@@ -89,6 +89,70 @@ export const defaultEntityTypes = [
     description: "Fallback labels when no specific entity type fits.",
     weight: 0.5,
     similarityThreshold: 0.7
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000012",
+    type: "requirement",
+    name: "requirement",
+    description: "Automatically discovered requirements, rules, standards and constraints.",
+    weight: 1.4,
+    similarityThreshold: 0.78
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000013",
+    type: "document_material",
+    name: "document_material",
+    description: "Automatically discovered documents, materials, reports, forms and attachments.",
+    weight: 1.2,
+    similarityThreshold: 0.78
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000014",
+    type: "process",
+    name: "process",
+    description: "Automatically discovered workflows, tasks, steps and operations.",
+    weight: 1.3,
+    similarityThreshold: 0.78
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000015",
+    type: "system_object",
+    name: "system_object",
+    description: "Automatically discovered systems, modules, features, pages and tools.",
+    weight: 1.3,
+    similarityThreshold: 0.78
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000016",
+    type: "data_object",
+    name: "data_object",
+    description: "Automatically discovered data, fields, records, logs, permissions and configurations.",
+    weight: 1.2,
+    similarityThreshold: 0.78
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000017",
+    type: "time_constraint",
+    name: "time_constraint",
+    description: "Automatically discovered time limits, periods, cycles and deadlines.",
+    weight: 1.2,
+    similarityThreshold: 0.82
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000018",
+    type: "amount_or_score",
+    name: "amount_or_score",
+    description: "Automatically discovered amounts, prices, costs, scores and quantities.",
+    weight: 1.2,
+    similarityThreshold: 0.82
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000019",
+    type: "risk_or_exception",
+    name: "risk_or_exception",
+    description: "Automatically discovered risks, exceptions, errors, warnings and failures.",
+    weight: 1.2,
+    similarityThreshold: 0.78
   }
 ] as const;
 

@@ -4,6 +4,7 @@ import {
   ArchiveRestore,
   ChevronLeft,
   ChevronRight,
+  Database,
   FileText,
   Folder,
   FolderOpen,
@@ -18,6 +19,7 @@ import {
   Square,
   Trash2,
   Upload,
+  Wrench,
   Zap
 } from "lucide-react";
 import { api } from "./lib/api";
@@ -38,6 +40,7 @@ import type {
   ModelCallLogRecord,
   ProjectGraphRecord,
   ProjectStatsRecord,
+  KnowledgeEdgeRecord,
   ChunkingMode,
   PublicAiProviderSettings,
   PublicMcpSettings,
@@ -55,8 +58,8 @@ import { Textarea } from "./components/ui/textarea";
 import { ProjectGraphFlow } from "./components/ProjectGraphFlow";
 import { I18nProvider, useI18n, useLanguageController, type LanguagePreference, type SupportedLanguage } from "./i18n";
 
-type WorkspaceView = "chat" | "documents" | "graph" | "mcp" | "settings";
-type ResultView = "overview" | "chunks" | "events" | "entities" | "search";
+type WorkspaceView = "chat" | "documents" | "graph" | "mcp" | "debug" | "settings";
+type ResultView = "overview" | "chunks" | "events" | "entities" | "relations" | "search";
 type ContextPanelMode = "process" | "logs";
 type ProcessStepStatus = "running" | "done" | "failed";
 type ProcessStep = {
@@ -118,6 +121,7 @@ function AppShell() {
   const [chunks, setChunks] = useState<ChunkRecord[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [entities, setEntities] = useState<EntityRecord[]>([]);
+  const [documentRelations, setDocumentRelations] = useState<KnowledgeEdgeRecord[]>([]);
   const [sessionsByProjectId, setSessionsByProjectId] = useState<Record<string, McpSessionRecord[]>>({});
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
   const [mcpDetail, setMcpDetail] = useState<McpSessionDetail | null>(null);
@@ -240,6 +244,7 @@ function AppShell() {
       setChunks([]);
       setEvents([]);
       setEntities([]);
+      setDocumentRelations([]);
       return;
     }
     void loadDocumentWorkspace(selectedDocumentId);
@@ -342,22 +347,49 @@ function AppShell() {
     }
   }
 
+  async function refreshCurrentProjectGraph() {
+    if (!selectedProjectId) {
+      return;
+    }
+    const [statsResponse, graphResponse] = await Promise.all([
+      api.getProjectStats(selectedProjectId),
+      api.getProjectGraph(selectedProjectId)
+    ]);
+    setProjectStats(statsResponse.stats);
+    setProjectGraph(graphResponse.graph);
+  }
+
   async function loadDocumentWorkspace(documentId: string) {
     try {
       setError("");
-      const [documentResponse, chunksResponse, eventsResponse, entitiesResponse] = await Promise.all([
+      const [documentResponse, chunksResponse, eventsResponse, entitiesResponse, relationsResponse] = await Promise.all([
         api.getDocument(documentId),
         api.listChunks(documentId),
         api.listEvents(documentId),
-        api.listEntities(documentId)
+        api.listEntities(documentId),
+        api.listDocumentRelations(documentId)
       ]);
       setSelectedDocument(documentResponse.document);
       setChunks(chunksResponse.chunks);
       setEvents(eventsResponse.events);
       setEntities(entitiesResponse.entities);
+      setDocumentRelations(relationsResponse.relations);
     } catch (err) {
       setError(getErrorMessage(err));
     }
+  }
+
+  async function refreshAfterExternalIngest(projectId?: string) {
+    const targetProjectId = projectId || selectedProjectId;
+    await loadProjects();
+    if (!targetProjectId) {
+      return;
+    }
+    if (targetProjectId !== selectedProjectId) {
+      setSelectedProjectId(targetProjectId);
+      return;
+    }
+    await loadProjectWorkspace(targetProjectId);
   }
 
   async function pollUploadJobs(jobIds: string[]) {
@@ -1167,6 +1199,7 @@ function AppShell() {
                 chunks={chunks}
                 events={events}
                 entities={entities}
+                relations={documentRelations}
                 projectStats={projectStats}
                 resultView={resultView}
                 showArchivedDocuments={showArchivedDocuments}
@@ -1196,6 +1229,7 @@ function AppShell() {
               <ProjectGraphWorkspace
                 project={selectedProject}
                 graph={projectGraph}
+                onRefresh={() => void refreshCurrentProjectGraph()}
                 onOpenEvent={(eventId) => void openEventDetail(eventId)}
                 onOpenEntity={(entityId) => void openEntityDetail(entityId)}
               />
@@ -1203,6 +1237,11 @@ function AppShell() {
               <ProjectMcpWorkspace
                 project={selectedProject}
                 settings={mcpSettings}
+              />
+            ) : workspaceView === "debug" ? (
+              <ExternalIngestDebugWorkspace
+                project={selectedProject}
+                onRefresh={(projectId) => void refreshAfterExternalIngest(projectId)}
               />
             ) : (
               <ConversationWorkspace
@@ -1612,10 +1651,11 @@ function MainWorkspaceTabs(props: {
     { value: "chat", label: t("对话", "Chat") },
     { value: "documents", label: t("文档", "Documents") },
     { value: "graph", label: t("图谱", "Graph") },
-    { value: "mcp", label: "MCP" }
+    { value: "mcp", label: "MCP" },
+    { value: "debug", label: t("调试", "Debug") }
   ];
   return (
-    <div className="grid w-full min-w-0 max-w-96 grid-cols-4 rounded-md border border-border p-1 sm:w-auto sm:min-w-80">
+    <div className="grid w-full min-w-0 max-w-[30rem] grid-cols-5 rounded-md border border-border p-1 sm:w-auto sm:min-w-[26rem]">
       {tabs.map((tab) => (
         <button
           key={tab.value}
@@ -1837,6 +1877,7 @@ function ProjectDocumentsWorkspace(props: {
   chunks: ChunkRecord[];
   events: EventRecord[];
   entities: EntityRecord[];
+  relations: KnowledgeEdgeRecord[];
   projectStats: ProjectStatsRecord | null;
   resultView: ResultView;
   showArchivedDocuments: boolean;
@@ -2016,7 +2057,7 @@ function ProjectDocumentsWorkspace(props: {
 
           <div className="min-h-0 overflow-y-auto p-4 scrollbar-thin md:p-6">
             <div className="flex flex-wrap gap-2">
-              {(["overview", "chunks", "events", "entities", "search"] as ResultView[]).map((view) => (
+              {(["overview", "chunks", "events", "entities", "relations", "search"] as ResultView[]).map((view) => (
                 <button
                   key={view}
                   className={cn(
@@ -2051,6 +2092,9 @@ function ProjectDocumentsWorkspace(props: {
               {props.resultView === "entities" ? (
                 <EntitiesPanel entities={paginatedEntities} hasFilter={Boolean(normalizedResultTitleQuery)} onOpenEntity={props.onOpenEntity} />
               ) : null}
+              {props.resultView === "relations" ? (
+                <DocumentRelationsPanel relations={props.relations} />
+              ) : null}
               {searchableResultView && activeResultCount > DOCUMENT_RESULT_PAGE_SIZE ? (
                 <PaginationControls
                   className="mt-4"
@@ -2082,6 +2126,7 @@ function ProjectDocumentsWorkspace(props: {
 function ProjectGraphWorkspace(props: {
   project: SourceRecord | null;
   graph: ProjectGraphRecord | null;
+  onRefresh: () => void;
   onOpenEvent: (eventId: string) => void;
   onOpenEntity: (entityId: string) => void;
 }) {
@@ -2105,8 +2150,8 @@ function ProjectGraphWorkspace(props: {
   }
 
   return (
-    <section className="flex min-h-0 flex-1 p-2 md:p-4">
-      <div className="min-h-0 flex-1">
+    <section className="flex min-h-0 flex-1 flex-col gap-3 p-2 md:p-4">
+      <div className="min-h-[420px] flex-1">
         <ProjectGraphFlow
           graph={graph}
           language={language}
@@ -2114,7 +2159,88 @@ function ProjectGraphWorkspace(props: {
           onOpenEntity={props.onOpenEntity}
         />
       </div>
+      <StrongRelationsPanel
+        relations={graph.knowledgeEdges ?? []}
+        onRefresh={props.onRefresh}
+      />
     </section>
+  );
+}
+
+function StrongRelationsPanel(props: {
+  relations: KnowledgeEdgeRecord[];
+  onRefresh: () => void;
+}) {
+  const { t } = useI18n();
+  const [busyEdgeId, setBusyEdgeId] = useState("");
+  async function run(edgeId: string, action: "confirm" | "reject" | "disable") {
+    setBusyEdgeId(edgeId);
+    try {
+      if (action === "confirm") await api.confirmRelation(edgeId);
+      if (action === "reject") await api.rejectRelation(edgeId);
+      if (action === "disable") await api.disableRelation(edgeId);
+      props.onRefresh();
+    } finally {
+      setBusyEdgeId("");
+    }
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">{t("强关系边", "Strong relation edges")}</div>
+            <div className="mt-1 text-xs text-muted-foreground">{t(`共 ${props.relations.length} 条，CONFIRMED 会提升检索权重，REJECTED/DISABLED 不参与检索。`, `${props.relations.length} total. CONFIRMED boosts retrieval; REJECTED/DISABLED are excluded.`)}</div>
+          </div>
+          <Button variant="outline" size="sm" onClick={props.onRefresh}>{t("刷新", "Refresh")}</Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {props.relations.length === 0 ? (
+          <EmptyState title={t("暂无强关系边", "No strong relations yet")} description={t("导入并抽取文档后会在这里展示 subject-relation-object。", "After ingestion, subject-relation-object edges appear here.")} />
+        ) : (
+          <div className="max-h-80 overflow-auto rounded-md border border-border">
+            <table className="w-full min-w-[920px] text-left text-xs">
+              <thead className="sticky top-0 bg-muted text-muted-foreground">
+                <tr>
+                  <th className="px-2 py-2">{t("主体", "Subject")}</th>
+                  <th className="px-2 py-2">{t("关系", "Relation")}</th>
+                  <th className="px-2 py-2">{t("客体", "Object")}</th>
+                  <th className="px-2 py-2">{t("证据", "Evidence")}</th>
+                  <th className="px-2 py-2">{t("置信/质量", "Conf/Quality")}</th>
+                  <th className="px-2 py-2">{t("状态", "Status")}</th>
+                  <th className="px-2 py-2">{t("操作", "Actions")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.relations.map((edge) => (
+                  <tr key={edge.id} className="border-t border-border align-top">
+                    <td className="px-2 py-2 font-medium">{edge.subjectName}</td>
+                    <td className="px-2 py-2">
+                      <div>{edge.relationLabel}</div>
+                      <div className="text-muted-foreground">{edge.relationType}</div>
+                    </td>
+                    <td className="px-2 py-2 font-medium">{edge.objectName}</td>
+                    <td className="max-w-md px-2 py-2 text-muted-foreground">{edge.evidence || "-"}</td>
+                    <td className="px-2 py-2">
+                      {edge.confidence.toFixed(2)} / {(edge.qualityScore ?? edge.confidence).toFixed(2)}
+                    </td>
+                    <td className="px-2 py-2"><Badge>{edge.status ?? "AUTO"}</Badge></td>
+                    <td className="px-2 py-2">
+                      <div className="flex flex-wrap gap-1">
+                        <Button variant="outline" size="sm" disabled={busyEdgeId === edge.id} onClick={() => void run(edge.id, "confirm")}>{t("确认", "Confirm")}</Button>
+                        <Button variant="outline" size="sm" disabled={busyEdgeId === edge.id} onClick={() => void run(edge.id, "reject")}>{t("拒绝", "Reject")}</Button>
+                        <Button variant="ghost" size="sm" disabled={busyEdgeId === edge.id} onClick={() => void run(edge.id, "disable")}>{t("禁用", "Disable")}</Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -2563,6 +2689,36 @@ function EntitiesPanel(props: {
   );
 }
 
+function DocumentRelationsPanel({ relations }: { relations: KnowledgeEdgeRecord[] }) {
+  const { t } = useI18n();
+  if (relations.length === 0) {
+    return <EmptyState title={t("暂无强关系", "No strong relations")} description={t("当前文档还没有抽取到可审查的强关系边。", "This document has no extracted strong relation edges yet.")} />;
+  }
+  return (
+    <div className="space-y-2">
+      {relations.map((edge) => (
+        <Card key={edge.id}>
+          <CardContent className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold">
+                {edge.subjectName} <span className="text-muted-foreground">{edge.relationLabel}</span> {edge.objectName}
+              </div>
+              <div className="flex items-center gap-1">
+                <Badge>{edge.relationType}</Badge>
+                <Badge>{edge.status ?? "AUTO"}</Badge>
+              </div>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {t("置信度", "Confidence")} {edge.confidence.toFixed(2)} · {t("质量分", "Quality")} {(edge.qualityScore ?? edge.confidence).toFixed(2)}
+            </div>
+            {edge.evidence ? <p className="whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{edge.evidence}</p> : null}
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
 function SearchPanel(props: {
   query: string;
   searchMode: SearchMode;
@@ -2620,6 +2776,7 @@ function SearchPanel(props: {
                   <Badge>{section.score.toFixed(3)}</Badge>
                 </div>
                 <p className="line-clamp-5 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{section.content}</p>
+                {section.why ? <SearchWhyBlock why={section.why} /> : null}
               </CardContent>
             </Card>
           ))}
@@ -2629,6 +2786,639 @@ function SearchPanel(props: {
         <EmptyState title={t("还没有检索结果", "No search results yet")} description={t("检索范围固定为当前项目。", "The search scope is fixed to the current project.")} />
       )}
     </div>
+  );
+}
+
+function SearchWhyBlock({ why }: { why: NonNullable<SearchResult["sections"][number]["why"]> }) {
+  const { t } = useI18n();
+  return (
+    <div className="rounded-md border border-border bg-muted/25 p-2 text-xs">
+      <div className="mb-1 flex flex-wrap items-center gap-2">
+        <span className="font-medium">{t("为什么召回", "Why recalled")}</span>
+        <Badge>{recallTypeLabel(why.recallType, t)}</Badge>
+        {why.fallback ? <Badge>{t("降级", "Fallback")}</Badge> : null}
+      </div>
+      {why.matchedEntities.length > 0 ? (
+        <div className="mt-1 text-muted-foreground">
+          {t("命中实体", "Entities")}：{why.matchedEntities.slice(0, 8).map((entity) => entity.name).join("、")}
+        </div>
+      ) : null}
+      {why.matchedEdges.length > 0 ? (
+        <div className="mt-1 space-y-1">
+          {why.matchedEdges.slice(0, 4).map((edge) => (
+            <div key={edge.id} className="text-muted-foreground">
+              {edge.subjectName} <span className="font-medium text-foreground">{edge.relationLabel}</span> {edge.objectName}
+              <span className="ml-1">({edge.relationType}, {edge.confidence.toFixed(2)})</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {why.graphPaths.length > 0 ? (
+        <div className="mt-1 space-y-1">
+          {why.graphPaths.slice(0, 3).map((path, index) => (
+            <div key={`${path.reason}-${index}`} className="text-muted-foreground">
+              {t("路径", "Path")}：{path.reason} ({path.score.toFixed(2)})
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {why.evidence.length > 0 ? (
+        <div className="mt-1 space-y-1">
+          {why.evidence.slice(0, 3).map((item, index) => (
+            <div key={`${item.edgeId ?? index}-${index}`} className="line-clamp-2 text-muted-foreground">
+              {t("证据", "Evidence")}：{item.text}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function recallTypeLabel(type: NonNullable<SearchResult["sections"][number]["why"]>["recallType"], t: ReturnType<typeof useI18n>["t"]) {
+  if (type === "graph_path") return t("路径推理", "Graph path");
+  if (type === "knowledge_edge") return t("强关系", "Strong edge");
+  if (type === "entity") return t("实体", "Entity");
+  if (type === "fallback") return t("降级", "Fallback");
+  return t("向量", "Vector");
+}
+
+const DEFAULT_DEBUG_CONTENT = `# 注册信息安全工程师证书-熊巍
+
+持证人：熊巍
+证书名称：注册信息安全工程师（CISP）
+专业方向：信息安全管理
+有效期：2024-01-01 至 2027-01-01
+可用于响应：项目负责人或安全负责人具备信息安全相关证书要求。`;
+
+function ExternalIngestDebugWorkspace(props: {
+  project: SourceRecord | null;
+  onRefresh: (projectId?: string) => void;
+}) {
+  const { t } = useI18n();
+  const [sourceId, setSourceId] = useState(props.project?.id ?? "");
+  const [externalId, setExternalId] = useState("debug-resource-cisp-xiongwei");
+  const [title, setTitle] = useState(t("注册信息安全工程师证书-熊巍", "CISP Certificate - Xiongwei"));
+  const [content, setContent] = useState(DEFAULT_DEBUG_CONTENT);
+  const [metadataText, setMetadataText] = useState(JSON.stringify({
+    sourceSystem: "debug",
+    resourceId: "debug-resource-cisp-xiongwei",
+    assetType: "certificate"
+  }, null, 2));
+  const [batchText, setBatchText] = useState("");
+  const [query, setQuery] = useState(t("项目负责人 CISP 证书可以用什么材料响应", "Which material can satisfy the project manager CISP certificate requirement?"));
+  const [replaceExisting, setReplaceExisting] = useState(true);
+  const [extract, setExtract] = useState(true);
+  const [milvusAddress, setMilvusAddress] = useState("192.168.1.156:19530");
+  const [milvusDatabase, setMilvusDatabase] = useState("default");
+  const [milvusUsername, setMilvusUsername] = useState("root");
+  const [milvusPassword, setMilvusPassword] = useState("");
+  const [milvusCollection, setMilvusCollection] = useState("doc_markdown");
+  const [milvusFilter, setMilvusFilter] = useState("status == 1");
+  const [milvusLimit, setMilvusLimit] = useState(10);
+  const [milvusOffset, setMilvusOffset] = useState(0);
+  const [milvusIdField, setMilvusIdField] = useState("doc_id");
+  const [milvusTitleField, setMilvusTitleField] = useState("doc_name");
+  const [milvusMarkdownUrlField, setMilvusMarkdownUrlField] = useState("md_url");
+  const [isRunning, setIsRunning] = useState(false);
+  const [result, setResult] = useState<unknown>(null);
+  const [lastImportSummary, setLastImportSummary] = useState("");
+  const [milvusPreview, setMilvusPreview] = useState<Awaited<ReturnType<typeof api.previewMilvusMarkdown>> | null>(null);
+  const [domainAnalysis, setDomainAnalysis] = useState<Awaited<ReturnType<typeof api.analyzeBiddingDomain>> | null>(null);
+  const [relationConfigText, setRelationConfigText] = useState("");
+  const [relationConfigError, setRelationConfigError] = useState("");
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
+  const [localError, setLocalError] = useState("");
+
+  useEffect(() => {
+    if (props.project?.id && props.project.id !== sourceId) {
+      setSourceId(props.project.id);
+    }
+  }, [props.project?.id, sourceId]);
+
+  useEffect(() => {
+    if (!batchText) {
+      const sid = props.project?.id || "项目ID";
+      setBatchText(JSON.stringify({
+        continueOnError: true,
+        documents: [
+          {
+            sourceId: sid,
+            externalId: "debug-resource-cisp-xiongwei",
+            title: "注册信息安全工程师证书-熊巍",
+            content: DEFAULT_DEBUG_CONTENT,
+            metadata: { sourceSystem: "debug", assetType: "certificate" },
+            extract: true,
+            replaceExisting: true
+          },
+          {
+            sourceId: sid,
+            externalId: "debug-resource-labor-xiongwei",
+            title: "熊巍劳动合同",
+            content: "熊巍与本公司签订劳动合同，岗位为项目负责人，合同期限覆盖本项目服务期。",
+            metadata: { sourceSystem: "debug", assetType: "labor_contract" },
+            extract: true,
+            replaceExisting: true
+          }
+        ]
+      }, null, 2));
+    }
+  }, [batchText, props.project?.id]);
+
+  const resolvedSourceId = sourceId.trim() || props.project?.id || "";
+
+  useEffect(() => {
+    if (!resolvedSourceId) {
+      setRelationConfigText("");
+      return;
+    }
+    void loadRelationConfig();
+  }, [resolvedSourceId]);
+
+  async function loadRelationConfig() {
+    if (!resolvedSourceId) return;
+    try {
+      const response = await api.getRelationConfig(resolvedSourceId);
+      setRelationConfigText(JSON.stringify(response.config, null, 2));
+      setRelationConfigError("");
+    } catch (error) {
+      setRelationConfigError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function saveRelationConfig() {
+    if (!resolvedSourceId) return;
+    try {
+      const parsed = JSON.parse(relationConfigText) as Record<string, unknown>;
+      const response = await api.updateRelationConfig(resolvedSourceId, parsed);
+      setRelationConfigText(JSON.stringify(response.config, null, 2));
+      setRelationConfigError("");
+      setResult(response);
+    } catch (error) {
+      setRelationConfigError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function buildMilvusInput() {
+    if (!milvusAddress.trim()) {
+      throw new Error(t("请填写 Milvus 地址。", "Enter the Milvus address."));
+    }
+    if (!milvusCollection.trim()) {
+      throw new Error(t("请填写 Milvus 集合名。", "Enter the Milvus collection name."));
+    }
+    return {
+      connection: {
+        address: milvusAddress.trim(),
+        username: milvusUsername.trim() || undefined,
+        password: milvusPassword || undefined,
+        database: milvusDatabase.trim() || undefined
+      },
+      collectionName: milvusCollection.trim(),
+      sourceId: resolvedSourceId || undefined,
+      filter: milvusFilter.trim() || undefined,
+      limit: milvusLimit,
+      offset: milvusOffset,
+      idField: milvusIdField.trim() || undefined,
+      titleField: milvusTitleField.trim() || undefined,
+      markdownUrlField: milvusMarkdownUrlField.trim() || undefined,
+      extract,
+      replaceExisting,
+      continueOnError: true
+    };
+  }
+
+  async function runSingleIngest() {
+    setLocalError("");
+    setResult(null);
+    setLastImportSummary("");
+    setIsRunning(true);
+    try {
+      const metadata = parseJsonObject(metadataText, "metadata");
+      const response = await api.ingestDocument({
+        sourceId: resolvedSourceId || undefined,
+        externalId: externalId.trim() || undefined,
+        title: title.trim() || externalId.trim() || "debug-material",
+        content,
+        metadata,
+        extract,
+        replaceExisting
+      });
+      setSourceId(response.sourceId);
+      setResult(response);
+      setLastImportSummary(t(`已写入项目 ${shortId(response.sourceId)}，文档 ${shortId(response.documentId)}，事件 ${response.eventCount} 个。`, `Ingested into project ${shortId(response.sourceId)}, document ${shortId(response.documentId)}, ${response.eventCount} events.`));
+      props.onRefresh(response.sourceId);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function runBatchIngest() {
+    setLocalError("");
+    setResult(null);
+    setLastImportSummary("");
+    setIsRunning(true);
+    try {
+      const parsed = JSON.parse(batchText) as { documents?: unknown; continueOnError?: boolean };
+      if (!Array.isArray(parsed.documents)) {
+        throw new Error("documents must be an array");
+      }
+      const response = await api.ingestDocuments(parsed as Parameters<typeof api.ingestDocuments>[0]);
+      const firstSourceId = response.results.find((item) => item.result?.sourceId)?.result?.sourceId;
+      if (firstSourceId) {
+        setSourceId(firstSourceId);
+      }
+      setResult(response);
+      setLastImportSummary(t(`批量写入完成：成功 ${response.succeeded} 条，失败 ${response.failed} 条，项目 ${shortId(firstSourceId || resolvedSourceId)}。`, `Batch ingest complete: ${response.succeeded} succeeded, ${response.failed} failed, project ${shortId(firstSourceId || resolvedSourceId)}.`));
+      props.onRefresh(firstSourceId || resolvedSourceId);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function runMilvusImport() {
+    setLocalError("");
+    setResult(null);
+    setLastImportSummary("");
+    setIsRunning(true);
+    try {
+      const response = await api.importMilvusMarkdown(buildMilvusInput());
+      if (response.sourceId) {
+        setSourceId(response.sourceId);
+      }
+      setResult(response);
+      setLastImportSummary(t(`Milvus 同步完成：获取 ${response.fetched} 条，成功 ${response.succeeded} 条，失败 ${response.failed} 条，项目 ${shortId(response.sourceId || resolvedSourceId)}。`, `Milvus sync complete: fetched ${response.fetched}, ${response.succeeded} succeeded, ${response.failed} failed, project ${shortId(response.sourceId || resolvedSourceId)}.`));
+      props.onRefresh(response.sourceId || resolvedSourceId);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function runMilvusPreview() {
+    setLocalError("");
+    setResult(null);
+    setMilvusPreview(null);
+    setIsRunning(true);
+    try {
+      const response = await api.previewMilvusMarkdown(buildMilvusInput());
+      setMilvusPreview(response);
+      setResult(response);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function runDebugSearch() {
+    setLocalError("");
+    setSearchResult(null);
+    setIsRunning(true);
+    try {
+      if (!resolvedSourceId) {
+        throw new Error(t("请先填写 sourceId 或选择项目。", "Enter a sourceId or select a project first."));
+      }
+      const response = await api.search({
+        query,
+        sourceIds: [resolvedSourceId],
+        searchMode: "fast",
+        topK: 5
+      });
+      setSearchResult(response);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function runDomainAnalysis() {
+    setLocalError("");
+    setResult(null);
+    setDomainAnalysis(null);
+    setIsRunning(true);
+    try {
+      if (!resolvedSourceId) {
+        throw new Error(t("请先填写 sourceId 或选择项目。", "Enter a sourceId or select a project first."));
+      }
+      const response = await api.analyzeBiddingDomain(resolvedSourceId);
+      setDomainAnalysis(response);
+      setResult(response);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  return (
+    <section className="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6">
+      <div className="mx-auto grid max-w-6xl gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">{t("外部同步调试", "External ingest debug")}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("把业务系统解析后的文本和 resource_id 直接写入 SAG，并用检索结果检查 externalId 映射。", "Send parsed text and resource_id into SAG, then verify externalId mapping in search results.")}
+            </p>
+          </div>
+          <Badge className="gap-1">
+            <Wrench className="h-3.5 w-3.5" />
+            {props.project?.name ?? t("未选择项目", "No project")}
+          </Badge>
+        </div>
+
+        {localError ? (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{localError}</div>
+        ) : null}
+        {lastImportSummary ? (
+          <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{lastImportSummary}</div>
+        ) : null}
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <div className="flex items-center gap-2 text-sm font-semibold">
+                  <Database className="h-4 w-4" />
+                  {t("从 Milvus doc_markdown 导入", "Import from Milvus doc_markdown")}
+                </div>
+              </CardHeader>
+              <CardContent className="grid gap-3">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Field label={t("Milvus 地址", "Milvus address")}>
+                    <Input value={milvusAddress} onChange={(event) => setMilvusAddress(event.target.value)} placeholder="host:19530" />
+                  </Field>
+                  <Field label={t("数据库", "Database")}>
+                    <Input value={milvusDatabase} onChange={(event) => setMilvusDatabase(event.target.value)} placeholder="default" />
+                  </Field>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Field label={t("用户名", "Username")}>
+                    <Input value={milvusUsername} onChange={(event) => setMilvusUsername(event.target.value)} />
+                  </Field>
+                  <Field label={t("密码（本次请求使用，不保存）", "Password (used for this request only)")}>
+                    <Input type="password" value={milvusPassword} onChange={(event) => setMilvusPassword(event.target.value)} autoComplete="off" />
+                  </Field>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Field label={t("集合 / 表名", "Collection")}>
+                    <Input value={milvusCollection} onChange={(event) => setMilvusCollection(event.target.value)} />
+                  </Field>
+                  <Field label={t("过滤条件", "Filter")}>
+                    <Input value={milvusFilter} onChange={(event) => setMilvusFilter(event.target.value)} placeholder='doc_id != ""' />
+                  </Field>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Field label={t("同步数量", "Limit")}>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={milvusLimit}
+                      onChange={(event) => setMilvusLimit(Number(event.target.value))}
+                    />
+                  </Field>
+                  <Field label={t("偏移", "Offset")}>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      value={milvusOffset}
+                      onChange={(event) => setMilvusOffset(Number(event.target.value))}
+                    />
+                  </Field>
+                </div>
+                <div className="grid gap-3 md:grid-cols-3">
+                  <Field label="externalId 字段">
+                    <Input value={milvusIdField} onChange={(event) => setMilvusIdField(event.target.value)} />
+                  </Field>
+                  <Field label={t("标题字段", "Title field")}>
+                    <Input value={milvusTitleField} onChange={(event) => setMilvusTitleField(event.target.value)} />
+                  </Field>
+                  <Field label="Markdown URL 字段">
+                    <Input value={milvusMarkdownUrlField} onChange={(event) => setMilvusMarkdownUrlField(event.target.value)} />
+                  </Field>
+                </div>
+                <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />
+                    replaceExisting
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={extract} onChange={(event) => setExtract(event.target.checked)} />
+                    extract
+                  </label>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="secondary" onClick={() => void runMilvusPreview()} disabled={isRunning || !milvusAddress.trim() || !milvusCollection.trim()}>
+                    {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                    {t("预览命中文档", "Preview matched docs")}
+                  </Button>
+                  <Button onClick={() => void runMilvusImport()} disabled={isRunning || !milvusAddress.trim() || !milvusCollection.trim()}>
+                    {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+                    {t("从 Milvus 拉取并同步到 SAG", "Pull from Milvus and sync to SAG")}
+                  </Button>
+                </div>
+                {milvusPreview ? (
+                  <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
+                    <div className="text-xs font-medium text-muted-foreground">
+                      {t(`预览 ${milvusPreview.total} 条命中文档`, `${milvusPreview.total} matched docs`)}
+                    </div>
+                    {milvusPreview.rows.length > 0 ? (
+                      <div className="space-y-2">
+                        {milvusPreview.rows.map((row) => (
+                          <div key={`${row.index}-${row.externalId ?? row.title ?? "row"}`} className="rounded-md border border-border bg-background p-2">
+                            <div className="truncate text-sm font-medium">{row.title || "-"}</div>
+                            <div className="mt-1 truncate text-xs text-muted-foreground">doc_id: {row.externalId || "-"}</div>
+                            <div className="mt-1 truncate text-xs text-muted-foreground">md_url: {row.markdownUrl || "-"}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <EmptyLine text={t("当前条件没有命中文档。", "No documents matched the current filter.")} />
+                    )}
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("单条 /ingest", "Single /ingest")}</div>
+              </CardHeader>
+              <CardContent className="grid gap-3">
+                <Field label="sourceId">
+                  <Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} placeholder={props.project?.id || t("留空则创建新项目", "Leave empty to create a new project")} />
+                </Field>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Field label="externalId / resource_id">
+                    <Input value={externalId} onChange={(event) => setExternalId(event.target.value)} />
+                  </Field>
+                  <Field label={t("标题", "Title")}>
+                    <Input value={title} onChange={(event) => setTitle(event.target.value)} />
+                  </Field>
+                </div>
+                <Field label={t("正文", "Content")}>
+                  <Textarea className="min-h-52 font-mono text-xs leading-5" value={content} onChange={(event) => setContent(event.target.value)} />
+                </Field>
+                <Field label="metadata JSON">
+                  <Textarea className="min-h-28 font-mono text-xs leading-5" value={metadataText} onChange={(event) => setMetadataText(event.target.value)} />
+                </Field>
+                <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />
+                    replaceExisting
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={extract} onChange={(event) => setExtract(event.target.checked)} />
+                    extract
+                  </label>
+                </div>
+                <Button onClick={() => void runSingleIngest()} disabled={isRunning || !content.trim()}>
+                  {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                  {t("调用 /ingest", "Call /ingest")}
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("批量 /ingest/batch", "Batch /ingest/batch")}</div>
+              </CardHeader>
+              <CardContent className="grid gap-3">
+                <Textarea className="min-h-72 font-mono text-xs leading-5" value={batchText} onChange={(event) => setBatchText(event.target.value)} />
+                <Button onClick={() => void runBatchIngest()} disabled={isRunning || !batchText.trim()}>
+                  {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                  {t("调用 /ingest/batch", "Call /ingest/batch")}
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("当前项目领域实体分析", "Project domain entity analysis")}</div>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Button onClick={() => void runDomainAnalysis()} disabled={isRunning || !resolvedSourceId}>
+                  {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                  {t("分析当前项目内容", "Analyze current project")}
+                </Button>
+                {domainAnalysis ? (
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <Badge>{domainAnalysis.documentType || t("未知文档", "Unknown document")}</Badge>
+                      <span>{t(`分析 ${domainAnalysis.documentCount} 个文档，归并 ${domainAnalysis.entities.length} 个领域对象`, `${domainAnalysis.documentCount} documents, ${domainAnalysis.entities.length} merged domain objects`)}</span>
+                    </div>
+                    {domainAnalysis.entities.slice(0, 30).map((entity) => (
+                      <div key={`${entity.type}-${entity.name}`} className="rounded-md border border-border p-2">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium">{entity.name}</div>
+                            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                              <span>{entity.type}</span>
+                              {entity.confidence != null ? <span>{Math.round(entity.confidence * 100)}%</span> : null}
+                              {entity.aliases && entity.aliases.length > 0 ? <span>{t("别名", "Aliases")}: {entity.aliases.slice(0, 3).join(" / ")}</span> : null}
+                            </div>
+                          </div>
+                          <Badge>{entity.count}</Badge>
+                        </div>
+                        {entity.reason ? <div className="mt-2 line-clamp-2 text-xs text-muted-foreground">{entity.reason}</div> : null}
+                      </div>
+                    ))}
+                    {domainAnalysis.relations && domainAnalysis.relations.length > 0 ? (
+                      <div className="space-y-2 border-t border-border pt-3">
+                        <div className="text-xs font-medium text-muted-foreground">{t("对象关系", "Object relations")}</div>
+                        {domainAnalysis.relations.slice(0, 12).map((relation, index) => (
+                          <div key={`${relation.source}-${relation.relation}-${relation.target}-${index}`} className="rounded-md border border-border bg-muted/30 p-2 text-xs">
+                            <div className="font-medium">{relation.source} - {relation.relation} - {relation.target}</div>
+                            {relation.evidence ? <div className="mt-1 line-clamp-2 text-muted-foreground">{relation.evidence}</div> : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <EmptyLine text={t("点击后只分析当前项目已入库内容，不写入图谱。", "This analyzes ingested content only and does not write to the graph.")} />
+                )}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("项目级关系配置", "Project relation config")}</div>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Textarea className="min-h-64 font-mono text-xs leading-5" value={relationConfigText} onChange={(event) => setRelationConfigText(event.target.value)} />
+                {relationConfigError ? <div className="text-xs text-red-700">{relationConfigError}</div> : null}
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" onClick={() => void loadRelationConfig()} disabled={!resolvedSourceId || isRunning}>{t("重新读取", "Reload")}</Button>
+                  <Button onClick={() => void saveRelationConfig()} disabled={!resolvedSourceId || isRunning || !relationConfigText.trim()}>{t("保存关系配置", "Save relation config")}</Button>
+                </div>
+                <div className="text-xs leading-5 text-muted-foreground">
+                  {t("disabledRelations、relationAliases、entityAliases 搜索时立即生效；minConfidence 和 customRelations 对新导入或重建索引生效。", "disabledRelations, relationAliases, and entityAliases affect search immediately; minConfidence and customRelations affect future ingestion or rebuilds.")}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("检索验证", "Search verification")}</div>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Field label={t("问题", "Query")}>
+                  <Input value={query} onChange={(event) => setQuery(event.target.value)} />
+                </Field>
+                <Button onClick={() => void runDebugSearch()} disabled={isRunning || !query.trim()}>
+                  {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                  {t("检索并检查 externalId", "Search and inspect externalId")}
+                </Button>
+                {searchResult ? (
+                  <div className="space-y-2">
+                    {searchResult.sections.map((section) => (
+                      <Card key={section.chunkId}>
+                        <CardContent className="space-y-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-medium">{section.documentTitle || section.heading || t("结果切片", "Result chunk")}</div>
+                              <div className="mt-1 truncate text-xs text-muted-foreground">externalId: {section.externalId || "-"}</div>
+                            </div>
+                            <Badge>{section.score.toFixed(3)}</Badge>
+                          </div>
+                          <p className="line-clamp-5 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{section.content}</p>
+                        </CardContent>
+                      </Card>
+                    ))}
+                    <JsonBlock title={t("完整检索返回", "Full search response")} value={searchResult} compact />
+                  </div>
+                ) : (
+                  <EmptyState title={t("还没有验证结果", "No verification result yet")} description={t("先同步素材，再用这里检索 externalId 是否返回。", "Ingest materials first, then search here to check externalId.")} />
+                )}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="text-sm font-semibold">{t("接口返回", "API response")}</div>
+              </CardHeader>
+              <CardContent>
+                {result ? (
+                  <JsonBlock title={t("返回", "Response")} value={result} preserveRaw />
+                ) : (
+                  <EmptyLine text={t("调用 /ingest 或 /ingest/batch 后显示返回。", "The response appears after calling /ingest or /ingest/batch.")} />
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2642,6 +3432,8 @@ type SettingsInput = {
   llmModel: string;
   llmApiKey?: string;
   clearLlmApiKey?: boolean;
+  rerankModel: string;
+  rerankInstruct: string;
   llmTimeoutMs: number;
   llmMaxRetries: number;
   defaultSearchMode: SearchMode;
@@ -2649,6 +3441,7 @@ type SettingsInput = {
   defaultChunkingMode: ChunkingMode;
   chunkTokenLimit: number;
   chunkOverlapTokens: number;
+  biddingDomainConfig?: unknown;
 };
 
 const DEFAULT_SEARCH_TOP_K = 10;
@@ -2659,6 +3452,18 @@ const DEFAULT_CHUNK_OVERLAP_TOKENS = 100;
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(Math.trunc(value), max));
+}
+
+function parseJsonObject(text: string, label: string): Record<string, unknown> {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return {};
+  }
+  const value = JSON.parse(trimmed);
+  if (!isPlainRecord(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return value;
 }
 
 function normalizeChunkingMode(value: unknown): ChunkingMode {
@@ -2683,6 +3488,8 @@ function SettingsPanel(props: {
   const [llmModel, setLlmModel] = useState("");
   const [llmApiKey, setLlmApiKey] = useState("");
   const [clearLlmApiKey, setClearLlmApiKey] = useState(false);
+  const [rerankModel, setRerankModel] = useState("");
+  const [rerankInstruct, setRerankInstruct] = useState("");
   const [llmTimeoutMs, setLlmTimeoutMs] = useState(60000);
   const [llmMaxRetries, setLlmMaxRetries] = useState(2);
   const [defaultSearchMode, setDefaultSearchMode] = useState<SearchMode>("fast");
@@ -2690,6 +3497,8 @@ function SettingsPanel(props: {
   const [defaultChunkingMode, setDefaultChunkingMode] = useState<ChunkingMode>("heading_strict");
   const [chunkTokenLimit, setChunkTokenLimit] = useState(512);
   const [chunkOverlapTokens, setChunkOverlapTokens] = useState(100);
+  const [biddingDomainConfigText, setBiddingDomainConfigText] = useState("");
+  const [biddingDomainConfigError, setBiddingDomainConfigError] = useState("");
 
   useEffect(() => {
     if (!props.settings) return;
@@ -2702,6 +3511,8 @@ function SettingsPanel(props: {
     setLlmModel(props.settings.llmModel);
     setLlmApiKey("");
     setClearLlmApiKey(false);
+    setRerankModel(props.settings.rerankModel);
+    setRerankInstruct(props.settings.rerankInstruct);
     setLlmTimeoutMs(props.settings.llmTimeoutMs);
     setLlmMaxRetries(props.settings.llmMaxRetries);
     setDefaultSearchMode(props.settings.defaultSearchMode);
@@ -2712,6 +3523,8 @@ function SettingsPanel(props: {
     setChunkOverlapTokens(
       boundedInteger(props.settings.chunkOverlapTokens, DEFAULT_CHUNK_OVERLAP_TOKENS, 0, normalizedTokenLimit - 1)
     );
+    setBiddingDomainConfigText(JSON.stringify(props.settings.biddingDomainConfig, null, 2));
+    setBiddingDomainConfigError("");
   }, [props.settings]);
 
   useEffect(() => {
@@ -2725,6 +3538,14 @@ function SettingsPanel(props: {
       className="mx-auto grid max-w-4xl gap-4"
       onSubmit={(event) => {
         event.preventDefault();
+        let biddingDomainConfig: unknown;
+        try {
+          biddingDomainConfig = JSON.parse(biddingDomainConfigText);
+          setBiddingDomainConfigError("");
+        } catch (error) {
+          setBiddingDomainConfigError(error instanceof Error ? error.message : String(error));
+          return;
+        }
         props.onSave({
           embeddingBaseUrl,
           embeddingModel,
@@ -2735,13 +3556,16 @@ function SettingsPanel(props: {
           llmModel,
           llmApiKey,
           clearLlmApiKey,
+          rerankModel,
+          rerankInstruct,
           llmTimeoutMs,
           llmMaxRetries,
           defaultSearchMode,
           defaultSearchTopK,
           defaultChunkingMode,
           chunkTokenLimit,
-          chunkOverlapTokens
+          chunkOverlapTokens,
+          biddingDomainConfig
         });
       }}
     >
@@ -2810,6 +3634,12 @@ function SettingsPanel(props: {
         </Field>
         <Field label={t("LLM 模型", "LLM model")}>
           <Input value={llmModel} onChange={(event) => setLlmModel(event.target.value)} />
+        </Field>
+        <Field label={t("Rerank 模型", "Rerank model")}>
+          <Input value={rerankModel} onChange={(event) => setRerankModel(event.target.value)} />
+        </Field>
+        <Field label={t("Rerank 指令", "Rerank instruction")}>
+          <Input value={rerankInstruct} onChange={(event) => setRerankInstruct(event.target.value)} />
         </Field>
         <Field label={t("超时毫秒", "Timeout in ms")}>
           <Input type="number" min={1} value={llmTimeoutMs} onChange={(event) => setLlmTimeoutMs(Number(event.target.value))} />
@@ -2910,6 +3740,33 @@ function SettingsPanel(props: {
             onChange={(event) => setChunkOverlapTokens(Number(event.target.value))}
           />
         </Field>
+      </SettingsCard>
+
+      <SettingsCard title={t("应标领域配置", "Bidding domain")} badge={t("可调整", "Editable")}>
+        <div className="space-y-3 md:col-span-2">
+          <Textarea
+            className="min-h-96 font-mono text-xs leading-5"
+            spellCheck={false}
+            value={biddingDomainConfigText}
+            onChange={(event) => {
+              setBiddingDomainConfigText(event.target.value);
+              if (biddingDomainConfigError) {
+                setBiddingDomainConfigError("");
+              }
+            }}
+          />
+          {biddingDomainConfigError ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {t(`JSON 格式错误：${biddingDomainConfigError}`, `Invalid JSON: ${biddingDomainConfigError}`)}
+            </div>
+          ) : null}
+          <div className="text-xs leading-5 text-muted-foreground">
+            {t(
+              "修改 queryExpansions 会立即影响检索；修改 entityTypes、canonicalEntities、typeInference 会影响之后的新入库/重建索引。",
+              "Changes to queryExpansions affect search immediately; changes to entityTypes, canonicalEntities, and typeInference affect future ingestion or rebuilt indexes."
+            )}
+          </div>
+        </div>
       </SettingsCard>
 
       <SettingsCard title={t("危险操作", "Danger zone")} badge={t("谨慎", "Careful")}>
@@ -3615,6 +4472,7 @@ function resultViewLabel(view: ResultView, language: SupportedLanguage) {
   if (view === "chunks") return language === "en" ? "Chunks" : "切片";
   if (view === "events") return language === "en" ? "Events" : "事件";
   if (view === "entities") return language === "en" ? "Entities" : "实体";
+  if (view === "relations") return language === "en" ? "Relations" : "强关系";
   return language === "en" ? "Search" : "检索";
 }
 

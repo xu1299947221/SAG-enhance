@@ -11,6 +11,10 @@ import type {
   EventRecord,
   EventDetailRecord,
   EmbeddingPreview,
+  KnowledgeGraphPath,
+  KnowledgeEdgeRecord,
+  RelationConfigRecord,
+  RelationStatsRecord,
   AiProviderSettingsRecord,
   McpMessageRecord,
   McpMessageRole,
@@ -22,6 +26,7 @@ import type {
   ProjectStatsRecord,
   SourceRecord
 } from "../types.js";
+import { isReasoningRelation, relationStrength } from "../domain/relation-ontology.js";
 
 type Queryable = Pick<pg.Pool | pg.PoolClient, "query">;
 
@@ -67,6 +72,47 @@ function entityFromRow(row: Record<string, unknown>): EntityRecord {
     normalizedName: String(row.normalized_name),
     score: row.score == null ? undefined : Number(row.score),
     embedding: embeddingPreviewFromText(row.embedding_preview)
+  };
+}
+
+function knowledgeEdgeFromRow(row: Record<string, unknown>): KnowledgeEdgeRecord {
+  return {
+    id: String(row.id),
+    sourceId: String(row.source_id),
+    documentId: row.document_id == null ? null : String(row.document_id),
+    chunkId: row.chunk_id == null ? null : String(row.chunk_id),
+    eventId: row.event_id == null ? null : String(row.event_id),
+    subjectEntityId: String(row.subject_entity_id),
+    objectEntityId: String(row.object_entity_id),
+    subjectName: String(row.subject_name),
+    objectName: String(row.object_name),
+    relationType: String(row.relation_type),
+    relationLabel: String(row.relation_label),
+    evidence: row.evidence == null ? null : String(row.evidence),
+    evidenceStart: row.evidence_start == null ? null : Number(row.evidence_start),
+    evidenceEnd: row.evidence_end == null ? null : Number(row.evidence_end),
+    confidence: Number(row.confidence ?? 0),
+    qualityScore: row.quality_score == null ? undefined : Number(row.quality_score),
+    extractionMethod: row.extraction_method == null ? undefined : String(row.extraction_method),
+    extractionModel: row.extraction_model == null ? null : String(row.extraction_model),
+    promptVersion: row.prompt_version == null ? null : String(row.prompt_version),
+    status: row.status == null ? undefined : String(row.status) as KnowledgeEdgeRecord["status"],
+    score: row.score == null ? undefined : Number(row.score),
+    metadata: (row.metadata ?? {}) as Record<string, unknown>
+  };
+}
+
+function relationConfigFromRow(row: Record<string, unknown>): RelationConfigRecord {
+  return {
+    sourceId: String(row.source_id),
+    disabledRelations: Array.isArray(row.disabled_relations) ? row.disabled_relations.map(String) : [],
+    relationAliases: (row.relation_aliases ?? {}) as Record<string, string[]>,
+    entityAliases: (row.entity_aliases ?? {}) as Record<string, string>,
+    minConfidence: (row.min_confidence ?? {}) as Record<string, number>,
+    customRelations: Array.isArray(row.custom_relations) ? row.custom_relations : [],
+    metadata: (row.metadata ?? {}) as Record<string, unknown>,
+    createdAt: row.created_at == null ? undefined : new Date(String(row.created_at)).toISOString(),
+    updatedAt: row.updated_at == null ? undefined : new Date(String(row.updated_at)).toISOString()
   };
 }
 
@@ -387,6 +433,88 @@ export async function upsertEntity(input: {
   return entityFromRow(result.rows[0]);
 }
 
+export async function upsertKnowledgeEdge(input: {
+  sourceId: string;
+  documentId: string;
+  chunkId?: string | null;
+  eventId: string;
+  subjectEntityId: string;
+  objectEntityId: string;
+  subjectName: string;
+  objectName: string;
+  relationType: string;
+  relationLabel: string;
+  evidence?: string;
+  evidenceStart?: number | null;
+  evidenceEnd?: number | null;
+  confidence?: number;
+  qualityScore?: number;
+  extractionMethod?: string;
+  extractionModel?: string | null;
+  promptVersion?: string | null;
+  status?: KnowledgeEdgeRecord["status"];
+  metadata?: Record<string, unknown>;
+}, client?: Queryable): Promise<KnowledgeEdgeRecord> {
+  const confidence = Math.max(0, Math.min(1, input.confidence ?? 0.7));
+  const qualityScore = Math.max(0, Math.min(1, input.qualityScore ?? confidence));
+  const result = await db(client).query(
+    `
+      insert into knowledge_edges (
+        id, source_id, document_id, chunk_id, event_id,
+        subject_entity_id, object_entity_id, subject_name, object_name,
+        relation_type, relation_label, evidence, evidence_start, evidence_end,
+        confidence, quality_score, extraction_method, extraction_model, prompt_version, status, metadata
+      )
+      values (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        $10, $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20, $21::jsonb
+      )
+      on conflict (event_id, subject_entity_id, relation_type, object_entity_id) do update set
+        subject_name = excluded.subject_name,
+        object_name = excluded.object_name,
+        relation_label = excluded.relation_label,
+        evidence = coalesce(nullif(excluded.evidence, ''), knowledge_edges.evidence),
+        evidence_start = coalesce(excluded.evidence_start, knowledge_edges.evidence_start),
+        evidence_end = coalesce(excluded.evidence_end, knowledge_edges.evidence_end),
+        confidence = greatest(knowledge_edges.confidence, excluded.confidence),
+        quality_score = greatest(knowledge_edges.quality_score, excluded.quality_score),
+        extraction_method = excluded.extraction_method,
+        extraction_model = coalesce(excluded.extraction_model, knowledge_edges.extraction_model),
+        prompt_version = coalesce(excluded.prompt_version, knowledge_edges.prompt_version),
+        status = case when knowledge_edges.status = 'CONFIRMED' then knowledge_edges.status else excluded.status end,
+        metadata = knowledge_edges.metadata || excluded.metadata,
+        updated_at = now()
+      returning *
+    `,
+    [
+      randomUUID(),
+      input.sourceId,
+      input.documentId,
+      input.chunkId ?? null,
+      input.eventId,
+      input.subjectEntityId,
+      input.objectEntityId,
+      input.subjectName,
+      input.objectName,
+      input.relationType,
+      input.relationLabel,
+      input.evidence ?? null,
+      input.evidenceStart ?? null,
+      input.evidenceEnd ?? null,
+      confidence,
+      qualityScore,
+      input.extractionMethod ?? "domain_profile_relation",
+      input.extractionModel ?? null,
+      input.promptVersion ?? null,
+      input.status ?? "AUTO",
+      JSON.stringify(input.metadata ?? {})
+    ]
+  );
+  return knowledgeEdgeFromRow(result.rows[0]);
+}
+
 export async function searchEntitiesByVector(input: {
   sourceIds: string[];
   queryVector: number[];
@@ -482,8 +610,21 @@ export async function searchEntitiesByText(input: {
              greatest(
                coalesce(ts_rank_cd(ent.search_text, q.tsq), 0),
                similarity(ent.normalized_name, q.raw_query),
+               similarity(lower(coalesce(ent.description, '')), q.raw_query),
                case when q.raw_query like '%' || ent.normalized_name || '%' then 1.0 else 0 end,
-               case when ent.normalized_name = q.raw_query then 1.2 else 0 end
+               case when ent.normalized_name = q.raw_query then 1.2 else 0 end,
+               case
+                 when exists (
+                   select 1
+                   from regexp_split_to_table(q.raw_query, '\\s+') as term(value)
+                   where length(term.value) >= 2
+                     and (
+                       ent.normalized_name like '%' || term.value || '%'
+                       or lower(coalesce(ent.description, '')) like '%' || term.value || '%'
+                     )
+                 ) then 0.8
+                 else 0
+               end
              ) as score
       from entities ent
       cross join q
@@ -491,7 +632,17 @@ export async function searchEntitiesByText(input: {
         and (
           ent.search_text @@ q.tsq
           or ent.normalized_name % q.raw_query
+          or lower(coalesce(ent.description, '')) % q.raw_query
           or q.raw_query like '%' || ent.normalized_name || '%'
+          or exists (
+            select 1
+            from regexp_split_to_table(q.raw_query, '\\s+') as term(value)
+            where length(term.value) >= 2
+              and (
+                ent.normalized_name like '%' || term.value || '%'
+                or lower(coalesce(ent.description, '')) like '%' || term.value || '%'
+              )
+          )
         )
         and exists (
           select 1
@@ -510,6 +661,243 @@ export async function searchEntitiesByText(input: {
     [input.sourceIds, query, input.limit]
   );
   return result.rows.map(entityFromRow);
+}
+
+export async function getEntitiesByIds(input: {
+  sourceIds: string[];
+  entityIds: string[];
+  limit: number;
+}): Promise<EntityRecord[]> {
+  if (input.entityIds.length === 0) {
+    return [];
+  }
+  const result = await pool.query(
+    `
+      select ent.id, ent.source_id, ent.type, ent.name, ent.normalized_name, 1.0 as score
+      from entities ent
+      where ent.source_id = any($1::uuid[])
+        and ent.id = any($2::uuid[])
+        and exists (
+          select 1
+          from event_entities ee
+          join events e on e.id = ee.event_id
+          join documents d on d.id = e.document_id
+          join sources s on s.id = e.source_id
+          where ee.entity_id = ent.id
+            and e.deleted_at is null
+            and d.archived_at is null
+            and s.archived_at is null
+        )
+      order by array_position($2::uuid[], ent.id), ent.name
+      limit $3
+    `,
+    [input.sourceIds, input.entityIds, input.limit]
+  );
+  return result.rows.map(entityFromRow);
+}
+
+export async function searchKnowledgeEdges(input: {
+  sourceIds: string[];
+  query: string;
+  entityIds?: string[];
+  eventIds?: string[];
+  relationTypes?: string[];
+  minConfidence?: number;
+  limit: number;
+}): Promise<KnowledgeEdgeRecord[]> {
+  const entityIds = input.entityIds ?? [];
+  const eventIds = input.eventIds ?? [];
+  const relationTypes = input.relationTypes ?? [];
+  const minConfidence = input.minConfidence ?? 0;
+  const query = input.query.trim();
+  if (!query && entityIds.length === 0 && eventIds.length === 0) {
+    return [];
+  }
+  const result = await pool.query(
+    `
+      with q as (
+        select
+          case when length($2) > 0 then websearch_to_tsquery('simple', $2) else null end as tsq,
+          lower($2) as raw_query
+      )
+      select ke.*,
+             greatest(
+               case when q.tsq is null then 0 else coalesce(ts_rank_cd(ke.search_text, q.tsq), 0) end,
+               similarity(lower(ke.subject_name), q.raw_query),
+               similarity(lower(ke.object_name), q.raw_query),
+               similarity(lower(ke.relation_label), q.raw_query),
+               case when ke.subject_entity_id = any($3::uuid[]) or ke.object_entity_id = any($3::uuid[]) then 1.0 else 0 end,
+               case when ke.event_id = any($4::uuid[]) then 0.8 else 0 end
+             ) as score
+      from knowledge_edges ke
+      cross join q
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.source_id = any($1::uuid[])
+        and d.archived_at is null
+        and s.archived_at is null
+        and ke.status not in ('REJECTED', 'DISABLED')
+        and ke.confidence >= $6
+        and (cardinality($7::text[]) = 0 or ke.relation_type = any($7::text[]))
+        and (
+          (q.tsq is not null and ke.search_text @@ q.tsq)
+          or ke.subject_entity_id = any($3::uuid[])
+          or ke.object_entity_id = any($3::uuid[])
+          or ke.event_id = any($4::uuid[])
+          or lower(ke.subject_name) % q.raw_query
+          or lower(ke.object_name) % q.raw_query
+          or lower(ke.relation_label) % q.raw_query
+        )
+      order by score desc, ke.quality_score desc, ke.confidence desc, ke.created_at desc
+      limit $5
+    `,
+    [input.sourceIds, query, entityIds, eventIds, input.limit, minConfidence, relationTypes]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
+}
+
+export async function getEdgesByEntityIds(input: {
+  sourceIds: string[];
+  entityIds: string[];
+  relationTypes?: string[];
+  minConfidence?: number;
+  includeInactive?: boolean;
+  limit: number;
+}): Promise<KnowledgeEdgeRecord[]> {
+  if (input.entityIds.length === 0) return [];
+  const statusSql = input.includeInactive ? "" : "and ke.status not in ('REJECTED', 'DISABLED')";
+  const result = await pool.query(
+    `
+      select ke.*,
+             case when ke.subject_entity_id = any($2::uuid[]) or ke.object_entity_id = any($2::uuid[]) then 1.0 else 0 end as score
+      from knowledge_edges ke
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.source_id = any($1::uuid[])
+        and (ke.subject_entity_id = any($2::uuid[]) or ke.object_entity_id = any($2::uuid[]))
+        and d.archived_at is null
+        and s.archived_at is null
+        ${statusSql}
+        and ke.confidence >= $3
+        and (cardinality($4::text[]) = 0 or ke.relation_type = any($4::text[]))
+      order by ke.quality_score desc, ke.confidence desc, ke.created_at desc
+      limit $5
+    `,
+    [input.sourceIds, input.entityIds, input.minConfidence ?? 0, input.relationTypes ?? [], input.limit]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
+}
+
+export async function getEdgesByEventIds(input: {
+  sourceIds: string[];
+  eventIds: string[];
+  relationTypes?: string[];
+  minConfidence?: number;
+  includeInactive?: boolean;
+  limit: number;
+}): Promise<KnowledgeEdgeRecord[]> {
+  if (input.eventIds.length === 0) return [];
+  const statusSql = input.includeInactive ? "" : "and ke.status not in ('REJECTED', 'DISABLED')";
+  const result = await pool.query(
+    `
+      select ke.*, 1.0 as score
+      from knowledge_edges ke
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.source_id = any($1::uuid[])
+        and ke.event_id = any($2::uuid[])
+        and d.archived_at is null
+        and s.archived_at is null
+        ${statusSql}
+        and ke.confidence >= $3
+        and (cardinality($4::text[]) = 0 or ke.relation_type = any($4::text[]))
+      order by ke.quality_score desc, ke.confidence desc, ke.created_at desc
+      limit $5
+    `,
+    [input.sourceIds, input.eventIds, input.minConfidence ?? 0, input.relationTypes ?? [], input.limit]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
+}
+
+export async function expandKnowledgeGraphPaths(input: {
+  sourceIds: string[];
+  seedEntityIds: string[];
+  relationTypes?: string[];
+  minConfidence?: number;
+  maxDepth: number;
+  limit: number;
+}): Promise<KnowledgeGraphPath[]> {
+  const seedEntityIds = [...new Set(input.seedEntityIds)].filter(Boolean);
+  if (seedEntityIds.length === 0 || input.maxDepth <= 0) return [];
+  const allEdges = await getEdgesByEntityIds({
+    sourceIds: input.sourceIds,
+    entityIds: seedEntityIds,
+    relationTypes: input.relationTypes,
+    minConfidence: input.minConfidence,
+    limit: Math.max(input.limit * 8, 80)
+  });
+  const frontier = allEdges.map((edge) => ({
+    nodes: [edge.subjectEntityId, edge.objectEntityId],
+    edges: [edge]
+  }));
+  const paths: KnowledgeGraphPath[] = [];
+  const seen = new Set<string>();
+  while (frontier.length > 0 && paths.length < input.limit * 3) {
+    const current = frontier.shift()!;
+    const key = current.edges.map((edge) => edge.id).join(">");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    paths.push(toKnowledgePath(current.nodes, current.edges));
+    if (current.edges.length >= input.maxDepth) continue;
+    const tail = current.nodes[current.nodes.length - 1];
+    const nextEdges = await getEdgesByEntityIds({
+      sourceIds: input.sourceIds,
+      entityIds: [tail],
+      relationTypes: input.relationTypes,
+      minConfidence: input.minConfidence,
+      limit: 30
+    });
+    for (const edge of nextEdges) {
+      if (current.edges.some((item) => item.id === edge.id)) continue;
+      if (!isReasoningRelation(edge.relationType) || edge.relationType === "RELATED_TO") continue;
+      const nextNode = edge.subjectEntityId === tail ? edge.objectEntityId : edge.subjectEntityId;
+      if (current.nodes.includes(nextNode)) continue;
+      frontier.push({
+        nodes: [...current.nodes, nextNode],
+        edges: [...current.edges, edge]
+      });
+    }
+  }
+  return paths
+    .sort((a, b) => b.score - a.score)
+    .slice(0, input.limit);
+}
+
+function toKnowledgePath(entityIds: string[], edges: KnowledgeEdgeRecord[]): KnowledgeGraphPath {
+  const nameByEntityId = new Map<string, { name: string; type?: string }>();
+  for (const edge of edges) {
+    nameByEntityId.set(edge.subjectEntityId, { name: edge.subjectName });
+    nameByEntityId.set(edge.objectEntityId, { name: edge.objectName });
+  }
+  const avgConfidence = edges.reduce((sum, edge) => sum + edge.confidence, 0) / Math.max(edges.length, 1);
+  const avgQuality = edges.reduce((sum, edge) => sum + (edge.qualityScore ?? edge.confidence), 0) / Math.max(edges.length, 1);
+  const strengthScore = edges.reduce((sum, edge) => sum + (relationStrength(edge.relationType) === "strong" ? 0.08 : -0.08), 0);
+  const score = Math.max(0, Math.min(1, avgConfidence * 0.45 + avgQuality * 0.45 + strengthScore - (edges.length - 1) * 0.03));
+  return {
+    nodes: entityIds.map((entityId) => ({
+      entityId,
+      name: nameByEntityId.get(entityId)?.name ?? entityId,
+      type: nameByEntityId.get(entityId)?.type
+    })),
+    edges,
+    evidence: edges.map((edge) => ({
+      edgeId: edge.id,
+      text: edge.evidence ?? "",
+      confidence: edge.confidence
+    })).filter((item) => item.text),
+    score,
+    reason: edges.map((edge) => `${edge.subjectName} ${edge.relationLabel} ${edge.objectName}`).join(" -> ")
+  };
 }
 
 export async function getEventIdsByEntityIds(input: {
@@ -631,6 +1019,9 @@ export async function getSectionsForEvents(eventIds: string[]): Promise<Array<{
   chunkId: string;
   sourceId: string;
   documentId?: string;
+  externalId?: string;
+  documentTitle?: string;
+  documentMetadata?: Record<string, unknown>;
   heading?: string;
   content: string;
   rank: number;
@@ -641,6 +1032,7 @@ export async function getSectionsForEvents(eventIds: string[]): Promise<Array<{
   const result = await pool.query(
     `
       select e.id as event_id, c.id as chunk_id, c.source_id, c.document_id,
+             d.external_id, d.title as document_title, d.metadata as document_metadata,
              c.heading, c.content, c.rank
       from events e
       join source_chunks c on c.id = e.chunk_id
@@ -659,6 +1051,9 @@ export async function getSectionsForEvents(eventIds: string[]): Promise<Array<{
     chunkId: String(row.chunk_id),
     sourceId: String(row.source_id),
     documentId: row.document_id == null ? undefined : String(row.document_id),
+    externalId: row.external_id == null ? undefined : String(row.external_id),
+    documentTitle: row.document_title == null ? undefined : String(row.document_title),
+    documentMetadata: row.document_metadata == null ? undefined : row.document_metadata as Record<string, unknown>,
     heading: row.heading == null ? undefined : String(row.heading),
     content: String(row.content),
     rank: Number(row.rank)
@@ -673,6 +1068,9 @@ export async function searchChunksByVector(input: {
   chunkId: string;
   sourceId: string;
   documentId?: string;
+  externalId?: string;
+  documentTitle?: string;
+  documentMetadata?: Record<string, unknown>;
   heading?: string;
   content: string;
   rank: number;
@@ -680,7 +1078,9 @@ export async function searchChunksByVector(input: {
 }>> {
   const result = await pool.query(
     `
-      select c.id, c.source_id, c.document_id, c.heading, c.content, c.rank,
+      select c.id, c.source_id, c.document_id, d.external_id,
+             d.title as document_title, d.metadata as document_metadata,
+             c.heading, c.content, c.rank,
              1 - (c.embedding <=> $1::vector) as score
       from source_chunks c
       join documents d on d.id = c.document_id
@@ -698,11 +1098,80 @@ export async function searchChunksByVector(input: {
     chunkId: String(row.id),
     sourceId: String(row.source_id),
     documentId: row.document_id == null ? undefined : String(row.document_id),
+    externalId: row.external_id == null ? undefined : String(row.external_id),
+    documentTitle: row.document_title == null ? undefined : String(row.document_title),
+    documentMetadata: row.document_metadata == null ? undefined : row.document_metadata as Record<string, unknown>,
     heading: row.heading == null ? undefined : String(row.heading),
     content: String(row.content),
     rank: Number(row.rank),
     score: Number(row.score)
   }));
+}
+
+export async function getSectionsForKnowledgeEdges(edgeIds: string[]): Promise<Array<{
+  edgeId: string;
+  chunkId: string;
+  sourceId: string;
+  documentId?: string;
+  externalId?: string;
+  documentTitle?: string;
+  documentMetadata?: Record<string, unknown>;
+  heading?: string;
+  content: string;
+  rank: number;
+  score: number;
+}>> {
+  if (edgeIds.length === 0) return [];
+  const result = await pool.query(
+    `
+      select ke.id as edge_id, c.id as chunk_id, c.source_id, c.document_id,
+             d.external_id, d.title as document_title, d.metadata as document_metadata,
+             c.heading, c.content, c.rank,
+             greatest(ke.quality_score, ke.confidence) as score
+      from knowledge_edges ke
+      join source_chunks c on c.id = ke.chunk_id
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.id = any($1::uuid[])
+        and ke.status not in ('REJECTED', 'DISABLED')
+        and d.archived_at is null
+        and s.archived_at is null
+      order by array_position($1::uuid[], ke.id), c.rank
+    `,
+    [edgeIds]
+  );
+  return result.rows.map((row) => ({
+    edgeId: String(row.edge_id),
+    chunkId: String(row.chunk_id),
+    sourceId: String(row.source_id),
+    documentId: row.document_id == null ? undefined : String(row.document_id),
+    externalId: row.external_id == null ? undefined : String(row.external_id),
+    documentTitle: row.document_title == null ? undefined : String(row.document_title),
+    documentMetadata: row.document_metadata == null ? undefined : row.document_metadata as Record<string, unknown>,
+    heading: row.heading == null ? undefined : String(row.heading),
+    content: String(row.content),
+    rank: Number(row.rank),
+    score: Number(row.score)
+  }));
+}
+
+export async function getEdgesForSections(input: {
+  chunkIds: string[];
+  includeInactive?: boolean;
+}): Promise<KnowledgeEdgeRecord[]> {
+  if (input.chunkIds.length === 0) return [];
+  const statusSql = input.includeInactive ? "" : "and ke.status not in ('REJECTED', 'DISABLED')";
+  const result = await pool.query(
+    `
+      select ke.*
+      from knowledge_edges ke
+      where ke.chunk_id = any($1::uuid[])
+        ${statusSql}
+      order by ke.quality_score desc, ke.confidence desc
+    `,
+    [input.chunkIds]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
 }
 
 export async function getEventDetail(input: {
@@ -837,6 +1306,204 @@ export async function listDocumentsBySource(input: {
   return result.rows.map(documentFromRow);
 }
 
+export async function getRelationConfig(input: {
+  sourceId: string;
+  tenantId: string;
+}): Promise<RelationConfigRecord> {
+  await assertSourcesAccessible([input.sourceId], input.tenantId);
+  const result = await pool.query(
+    "select * from relation_configs where source_id = $1",
+    [input.sourceId]
+  );
+  if (result.rows[0]) {
+    return relationConfigFromRow(result.rows[0]);
+  }
+  return {
+    sourceId: input.sourceId,
+    disabledRelations: [],
+    relationAliases: {},
+    entityAliases: {},
+    minConfidence: {},
+    customRelations: [],
+    metadata: {}
+  };
+}
+
+export async function upsertRelationConfig(input: {
+  sourceId: string;
+  tenantId: string;
+  disabledRelations?: string[];
+  relationAliases?: Record<string, string[]>;
+  entityAliases?: Record<string, string>;
+  minConfidence?: Record<string, number>;
+  customRelations?: unknown[];
+  metadata?: Record<string, unknown>;
+}): Promise<RelationConfigRecord> {
+  await assertSourcesAccessible([input.sourceId], input.tenantId);
+  const result = await pool.query(
+    `
+      insert into relation_configs (
+        id, source_id, disabled_relations, relation_aliases, entity_aliases,
+        min_confidence, custom_relations, metadata
+      )
+      values ($1, $2, $3::text[], $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb)
+      on conflict (source_id) do update set
+        disabled_relations = excluded.disabled_relations,
+        relation_aliases = excluded.relation_aliases,
+        entity_aliases = excluded.entity_aliases,
+        min_confidence = excluded.min_confidence,
+        custom_relations = excluded.custom_relations,
+        metadata = relation_configs.metadata || excluded.metadata,
+        updated_at = now()
+      returning *
+    `,
+    [
+      randomUUID(),
+      input.sourceId,
+      input.disabledRelations ?? [],
+      JSON.stringify(input.relationAliases ?? {}),
+      JSON.stringify(input.entityAliases ?? {}),
+      JSON.stringify(input.minConfidence ?? {}),
+      JSON.stringify(input.customRelations ?? []),
+      JSON.stringify(input.metadata ?? {})
+    ]
+  );
+  return relationConfigFromRow(result.rows[0]);
+}
+
+export async function updateKnowledgeEdge(input: {
+  edgeId: string;
+  tenantId: string;
+  relationType?: string;
+  relationLabel?: string;
+  subjectName?: string;
+  objectName?: string;
+  evidence?: string | null;
+  confidence?: number;
+  qualityScore?: number;
+  status?: KnowledgeEdgeRecord["status"];
+  metadata?: Record<string, unknown>;
+  note?: string;
+}): Promise<KnowledgeEdgeRecord | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const beforeResult = await client.query(
+      `
+        select ke.*
+        from knowledge_edges ke
+        join sources s on s.id = ke.source_id
+        where ke.id = $1 and s.tenant_id = $2
+        for update
+      `,
+      [input.edgeId, input.tenantId]
+    );
+    if (!beforeResult.rows[0]) {
+      await client.query("rollback");
+      return null;
+    }
+    const before = knowledgeEdgeFromRow(beforeResult.rows[0]);
+    const result = await client.query(
+      `
+        update knowledge_edges
+        set
+          relation_type = coalesce($3, relation_type),
+          relation_label = coalesce($4, relation_label),
+          subject_name = coalesce($5, subject_name),
+          object_name = coalesce($6, object_name),
+          evidence = case when $7::boolean then $8 else evidence end,
+          confidence = coalesce($9, confidence),
+          quality_score = coalesce($10, quality_score),
+          status = coalesce($11, status),
+          metadata = metadata || $12::jsonb,
+          updated_at = now()
+        where id = $1
+        returning *
+      `,
+      [
+        input.edgeId,
+        input.tenantId,
+        input.relationType ?? null,
+        input.relationLabel ?? null,
+        input.subjectName ?? null,
+        input.objectName ?? null,
+        Object.prototype.hasOwnProperty.call(input, "evidence"),
+        input.evidence ?? null,
+        input.confidence ?? null,
+        input.qualityScore ?? null,
+        input.status ?? null,
+        JSON.stringify(input.metadata ?? {})
+      ]
+    );
+    const after = knowledgeEdgeFromRow(result.rows[0]);
+    await client.query(
+      `
+        insert into edge_feedback (
+          id, edge_id, source_id, action, previous_status, next_status,
+          previous_value, next_value, note
+        )
+        values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+      `,
+      [
+        randomUUID(),
+        after.id,
+        after.sourceId,
+        feedbackAction(after.status),
+        before.status ?? null,
+        after.status ?? null,
+        JSON.stringify(before),
+        JSON.stringify(after),
+        input.note ?? null
+      ]
+    );
+    await client.query("commit");
+    return after;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function feedbackAction(status: KnowledgeEdgeRecord["status"] | undefined): "CONFIRM" | "REJECT" | "DISABLE" | "UPDATE" {
+  if (status === "CONFIRMED") return "CONFIRM";
+  if (status === "REJECTED") return "REJECT";
+  if (status === "DISABLED") return "DISABLE";
+  return "UPDATE";
+}
+
+export async function listDocumentContentsBySource(input: {
+  sourceId: string;
+  tenantId: string;
+  limit: number;
+  includeArchived?: boolean;
+}): Promise<Array<{
+  id: string;
+  externalId?: string;
+  title: string;
+  content: string;
+}>> {
+  const archiveSql = input.includeArchived ? "" : "and d.archived_at is null";
+  const result = await pool.query(
+    `
+      select d.id, d.external_id, d.title, d.content
+      from documents d
+      join sources s on s.id = d.source_id
+      where d.source_id = $1 and s.tenant_id = $2 ${archiveSql}
+      order by d.created_at desc, d.id
+      limit $3
+    `,
+    [input.sourceId, input.tenantId, input.limit]
+  );
+  return result.rows.map((row) => ({
+    id: String(row.id),
+    externalId: row.external_id == null ? undefined : String(row.external_id),
+    title: String(row.title),
+    content: String(row.content ?? "")
+  }));
+}
+
 export async function updateDocument(input: {
   documentId: string;
   tenantId: string;
@@ -920,40 +1587,7 @@ export async function deleteDocument(input: {
       return false;
     }
 
-    await client.query(
-      `
-        with document_events as (
-          select id
-          from events
-          where document_id = $1
-        ),
-        candidate_entities as (
-          select distinct ee.entity_id
-          from event_entities ee
-          join document_events de on de.id = ee.event_id
-        ),
-        shared_entities as (
-          select distinct ee.entity_id
-          from event_entities ee
-          join events e on e.id = ee.event_id
-          where ee.entity_id in (select entity_id from candidate_entities)
-            and (e.document_id is distinct from $1)
-        )
-        delete from entities ent
-        where ent.id in (select entity_id from candidate_entities)
-          and ent.id not in (select entity_id from shared_entities)
-      `,
-      [input.documentId]
-    );
-
-    await client.query(
-      `
-        delete from documents d
-        using sources s
-        where d.source_id = s.id and d.id = $1 and s.tenant_id = $2
-      `,
-      [input.documentId, input.tenantId]
-    );
+    await deleteDocumentGraphById(input.documentId, client);
     await client.query("commit");
     return true;
   } catch (error) {
@@ -962,6 +1596,81 @@ export async function deleteDocument(input: {
   } finally {
     client.release();
   }
+}
+
+export async function deleteDocumentByExternalId(input: {
+  sourceId: string;
+  externalId: string;
+  tenantId: string;
+}, client?: Queryable): Promise<string[]> {
+  const result = await db(client).query(
+    `
+      select d.id
+      from documents d
+      join sources s on s.id = d.source_id
+      where d.source_id = $1 and d.external_id = $2 and s.tenant_id = $3
+      order by d.created_at desc
+    `,
+    [input.sourceId, input.externalId, input.tenantId]
+  );
+  const documentIds = result.rows.map((row) => String(row.id)).filter(Boolean);
+  for (const documentId of documentIds) {
+    await deleteDocumentGraphById(documentId, client);
+  }
+  return documentIds;
+}
+
+export async function deleteDocumentGraphById(documentId: string, client?: Queryable): Promise<void> {
+  await db(client).query(
+    `
+      with document_events as (
+        select id
+        from events
+        where document_id = $1
+      ),
+      candidate_entities as (
+        select distinct ee.entity_id
+        from event_entities ee
+        join document_events de on de.id = ee.event_id
+      ),
+      shared_entities as (
+        select distinct ee.entity_id
+        from event_entities ee
+        join events e on e.id = ee.event_id
+        where e.document_id <> $1
+          and ee.entity_id in (select entity_id from candidate_entities)
+      ),
+      deleted_event_entities as (
+        delete from event_entities
+        where event_id in (select id from document_events)
+        returning entity_id
+      ),
+      deleted_events as (
+        delete from events
+        where document_id = $1
+        returning id
+      ),
+      deleted_chunks as (
+        delete from source_chunks
+        where document_id = $1
+        returning id
+      ),
+      deleted_sections as (
+        delete from document_sections
+        where document_id = $1
+        returning id
+      ),
+      deleted_document as (
+        delete from documents
+        where id = $1
+        returning id
+      )
+      delete from entities
+      where id in (select entity_id from candidate_entities)
+        and id not in (select entity_id from shared_entities)
+    `,
+    [documentId]
+  );
 }
 
 export async function getProjectStats(input: {
@@ -974,7 +1683,9 @@ export async function getProjectStats(input: {
         count(distinct d.id)::int as document_count,
         count(distinct c.id)::int as chunk_count,
         count(distinct e.id)::int as event_count,
-        count(distinct ent.id)::int as entity_count
+        count(distinct ent.id)::int as entity_count,
+        count(distinct ke.id)::int as knowledge_edge_count,
+        count(distinct ke.id) filter (where ke.confidence < 0.65 or ke.quality_score < 0.65)::int as low_confidence_edge_count
       from sources s
       left join documents d
         on d.source_id = s.id
@@ -988,6 +1699,9 @@ export async function getProjectStats(input: {
         on ee.event_id = e.id
       left join entities ent
         on ent.id = ee.entity_id
+      left join knowledge_edges ke
+        on ke.document_id = d.id
+       and ke.status not in ('REJECTED', 'DISABLED')
       where s.id = $1
         and s.tenant_id = $2
       group by s.id
@@ -999,7 +1713,118 @@ export async function getProjectStats(input: {
     documentCount: Number(row?.document_count ?? 0),
     chunkCount: Number(row?.chunk_count ?? 0),
     eventCount: Number(row?.event_count ?? 0),
-    entityCount: Number(row?.entity_count ?? 0)
+    entityCount: Number(row?.entity_count ?? 0),
+    knowledgeEdgeCount: Number(row?.knowledge_edge_count ?? 0),
+    lowConfidenceEdgeCount: Number(row?.low_confidence_edge_count ?? 0)
+  };
+}
+
+export async function listKnowledgeEdgesBySource(input: {
+  sourceId: string;
+  tenantId: string;
+  includeInactive?: boolean;
+  limit?: number;
+}): Promise<KnowledgeEdgeRecord[]> {
+  const statusSql = input.includeInactive ? "" : "and ke.status not in ('REJECTED', 'DISABLED')";
+  const result = await pool.query(
+    `
+      select ke.*
+      from knowledge_edges ke
+      join sources s on s.id = ke.source_id
+      left join documents d on d.id = ke.document_id
+      where ke.source_id = $1
+        and s.tenant_id = $2
+        and (d.id is null or d.archived_at is null)
+        ${statusSql}
+      order by
+        case ke.status when 'CONFIRMED' then 0 when 'AUTO' then 1 when 'REJECTED' then 2 else 3 end,
+        ke.quality_score desc,
+        ke.confidence desc,
+        ke.created_at desc
+      limit $3
+    `,
+    [input.sourceId, input.tenantId, Math.min(Math.max(input.limit ?? 300, 1), 1000)]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
+}
+
+export async function listKnowledgeEdgesByDocument(input: {
+  documentId: string;
+  tenantId: string;
+  includeInactive?: boolean;
+}): Promise<KnowledgeEdgeRecord[]> {
+  const statusSql = input.includeInactive ? "" : "and ke.status not in ('REJECTED', 'DISABLED')";
+  const result = await pool.query(
+    `
+      select ke.*
+      from knowledge_edges ke
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.document_id = $1
+        and s.tenant_id = $2
+        and d.archived_at is null
+        ${statusSql}
+      order by ke.quality_score desc, ke.confidence desc, ke.created_at desc
+    `,
+    [input.documentId, input.tenantId]
+  );
+  return result.rows.map(knowledgeEdgeFromRow);
+}
+
+export async function getRelationStats(input: {
+  sourceId: string;
+  tenantId: string;
+}): Promise<RelationStatsRecord> {
+  const summary = await pool.query(
+    `
+      select
+        count(*)::int as total,
+        count(*) filter (where ke.status not in ('REJECTED', 'DISABLED'))::int as active,
+        count(*) filter (where ke.status = 'CONFIRMED')::int as confirmed,
+        count(*) filter (where ke.status = 'REJECTED')::int as rejected,
+        count(*) filter (where ke.status = 'DISABLED')::int as disabled,
+        count(*) filter (where ke.confidence < 0.65 or ke.quality_score < 0.65)::int as low_confidence
+      from knowledge_edges ke
+      join sources s on s.id = ke.source_id
+      where ke.source_id = $1
+        and s.tenant_id = $2
+    `,
+    [input.sourceId, input.tenantId]
+  );
+  const byType = await pool.query(
+    `
+      select
+        ke.relation_type,
+        max(ke.relation_label) as relation_label,
+        count(*)::int as count,
+        count(*) filter (where ke.status not in ('REJECTED', 'DISABLED'))::int as active_count,
+        avg(ke.confidence)::float as avg_confidence,
+        avg(ke.quality_score)::float as avg_quality_score
+      from knowledge_edges ke
+      join sources s on s.id = ke.source_id
+      where ke.source_id = $1
+        and s.tenant_id = $2
+      group by ke.relation_type
+      order by active_count desc, count desc, ke.relation_type
+    `,
+    [input.sourceId, input.tenantId]
+  );
+  const row = summary.rows[0] ?? {};
+  return {
+    total: Number(row.total ?? 0),
+    active: Number(row.active ?? 0),
+    confirmed: Number(row.confirmed ?? 0),
+    rejected: Number(row.rejected ?? 0),
+    disabled: Number(row.disabled ?? 0),
+    lowConfidence: Number(row.low_confidence ?? 0),
+    byType: byType.rows.map((item) => ({
+      relationType: String(item.relation_type),
+      relationLabel: String(item.relation_label),
+      count: Number(item.count ?? 0),
+      activeCount: Number(item.active_count ?? 0),
+      avgConfidence: Number(item.avg_confidence ?? 0),
+      avgQualityScore: Number(item.avg_quality_score ?? 0)
+    }))
   };
 }
 
@@ -1040,10 +1865,6 @@ export async function getProjectGraph(input: {
     eventCount: Number(row.event_count ?? 0)
   }));
 
-  if (entities.length === 0) {
-    return { entities: [], events: [], edges: [] };
-  }
-
   const entityIds = entities.map((entity) => entity.id);
   const eventsResult = await pool.query(
     `
@@ -1066,7 +1887,7 @@ export async function getProjectGraph(input: {
         and s.tenant_id = $2
         and d.archived_at is null
         and e.deleted_at is null
-        and ee.entity_id = any($3::uuid[])
+        and (cardinality($3::uuid[]) = 0 or ee.entity_id = any($3::uuid[]))
       group by e.id
       order by e.rank, e.id
     `,
@@ -1086,7 +1907,28 @@ export async function getProjectGraph(input: {
     eventId: event.id
   })));
 
-  return { entities, events, edges };
+  const knowledgeEdgesResult = await pool.query(
+    `
+      select ke.*
+      from knowledge_edges ke
+      join documents d on d.id = ke.document_id
+      join sources s on s.id = ke.source_id
+      where ke.source_id = $1
+        and s.tenant_id = $2
+        and d.archived_at is null
+        and ke.status not in ('REJECTED', 'DISABLED')
+      order by ke.confidence desc, ke.created_at desc
+      limit 300
+    `,
+    [input.sourceId, input.tenantId]
+  );
+
+  return {
+    entities,
+    events,
+    edges,
+    knowledgeEdges: knowledgeEdgesResult.rows.map(knowledgeEdgeFromRow)
+  };
 }
 
 export async function getDocumentDetail(input: {

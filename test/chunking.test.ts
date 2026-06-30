@@ -66,6 +66,16 @@ describe("chunkMarkdown", () => {
     }
   });
 
+  it("keeps default heading_strict chunks under the configured token limit", () => {
+    const paragraph = "SAG retrieves long parsed markdown content for intelligent bidding evidence. ".repeat(1000);
+    const result = chunkMarkdown(paragraph, { mode: "heading_strict", maxTokens: 512, overlapTokens: 100 });
+
+    expect(result.chunks.length).toBeGreaterThan(1);
+    for (const chunk of result.chunks) {
+      expect(estimateTokens(chunk.rawContent)).toBeLessThanOrEqual(512);
+    }
+  });
+
   it("overlaps token chunks when configured", () => {
     const text = Array.from({ length: 180 }, (_, index) => `token${index}`).join(" ");
     const withoutOverlap = chunkMarkdown(text, { mode: "token", maxTokens: 80, overlapTokens: 0 });

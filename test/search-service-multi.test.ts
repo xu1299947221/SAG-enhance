@@ -6,19 +6,27 @@ import type { RerankClient } from "../src/ai/rerank-client.js";
 const repositories = vi.hoisted(() => ({
   assertSourcesAccessible: vi.fn(),
   coarseRankEventsByContent: vi.fn(),
+  getEntitiesByIds: vi.fn(),
+  getEdgesByEntityIds: vi.fn(),
+  getEdgesByEventIds: vi.fn(),
+  getEdgesForSections: vi.fn(),
   getEventIdsByEntityIds: vi.fn(),
   getEventsWithEntityIds: vi.fn(),
+  getRelationConfig: vi.fn(),
+  getSectionsForKnowledgeEdges: vi.fn(),
   getSectionsForEvents: vi.fn(),
+  expandKnowledgeGraphPaths: vi.fn(),
   searchChunksByVector: vi.fn(),
   searchEntitiesByName: vi.fn(),
   searchEntitiesByText: vi.fn(),
   searchEntitiesByVector: vi.fn(),
-  searchEventsByTitleVector: vi.fn()
+  searchEventsByTitleVector: vi.fn(),
+  searchKnowledgeEdges: vi.fn()
 }));
 
 vi.mock("../src/db/repositories.js", () => repositories);
 
-import { SearchService } from "../src/services/search-service.js";
+import { expandBidQueryEntities, SearchService } from "../src/services/search-service.js";
 
 describe("SearchService multi search", () => {
   beforeEach(() => {
@@ -29,8 +37,24 @@ describe("SearchService multi search", () => {
     repositories.searchEntitiesByName.mockResolvedValue([]);
     repositories.searchEntitiesByText.mockResolvedValue([]);
     repositories.searchEntitiesByVector.mockResolvedValue([]);
+    repositories.getEntitiesByIds.mockResolvedValue([]);
+    repositories.getEdgesByEntityIds.mockResolvedValue([]);
+    repositories.getEdgesByEventIds.mockResolvedValue([]);
+    repositories.getEdgesForSections.mockResolvedValue([]);
     repositories.getEventIdsByEntityIds.mockResolvedValue([]);
+    repositories.getRelationConfig.mockResolvedValue({
+      sourceId: "00000000-0000-0000-0000-000000000001",
+      disabledRelations: [],
+      relationAliases: {},
+      entityAliases: {},
+      minConfidence: {},
+      customRelations: [],
+      metadata: {}
+    });
     repositories.searchEventsByTitleVector.mockResolvedValue([]);
+    repositories.getSectionsForKnowledgeEdges.mockResolvedValue([]);
+    repositories.expandKnowledgeGraphPaths.mockResolvedValue([]);
+    repositories.searchKnowledgeEdges.mockResolvedValue([]);
     repositories.searchChunksByVector.mockResolvedValue([]);
   });
 
@@ -182,6 +206,9 @@ describe("SearchService multi search", () => {
       chunkId: `chunk-${index + 1}`,
       sourceId,
       documentId: item.documentId,
+      externalId: `resource-${index + 1}`,
+      documentTitle: `素材 ${index + 1}`,
+      documentMetadata: { ragResourceId: `resource-${index + 1}` },
       heading: item.title,
       content: item.content,
       rank: index,
@@ -200,6 +227,11 @@ describe("SearchService multi search", () => {
       topK: 50
     }));
     expect(result.sections).toHaveLength(6);
+    expect(result.sections[0]).toMatchObject({
+      externalId: "resource-1",
+      documentTitle: "素材 1",
+      documentMetadata: { ragResourceId: "resource-1" }
+    });
   });
 
   it("uses fast mode without LLM entity extraction or LLM rerank", async () => {
@@ -250,7 +282,7 @@ describe("SearchService multi search", () => {
     expect(llm.extractNamedEntities).not.toHaveBeenCalled();
     expect(llm.rerankEvents).not.toHaveBeenCalled();
     expect(repositories.searchEntitiesByText).toHaveBeenCalledWith(expect.objectContaining({
-      query: "SAG 为什么快",
+      query: expect.stringContaining("SAG 为什么快"),
       limit: 20
     }));
     expect(reranker.rerankEvents).toHaveBeenCalledWith(expect.objectContaining({
@@ -259,6 +291,249 @@ describe("SearchService multi search", () => {
     expect(result.trace?.searchMode).toBe("fast");
     expect(result.trace?.recalledEntities).toHaveLength(1);
     expect(result.sections).toHaveLength(3);
+  });
+
+  it("keeps bid-domain query entities visible in fast mode even when BM25 entity recall is empty", async () => {
+    const embeddings: EmbeddingClient = {
+      generate: vi.fn(async () => [1, 0, 0]),
+      batchGenerate: vi.fn()
+    };
+    const llm: LlmClient = {
+      extractNamedEntities: vi.fn(async () => ["不应调用"]),
+      extractEventsFromChunk: vi.fn(),
+      rerankEvents: vi.fn(async () => ["不应调用"])
+    };
+    const reranker: RerankClient = {
+      rerankEvents: vi.fn(async (input: { candidates: Array<{ id: string }>; topK: number }) => (
+        input.candidates.slice(0, input.topK).map((candidate) => candidate.id)
+      ))
+    };
+    const service = new SearchService(embeddings, llm, reranker);
+    const sourceId = "00000000-0000-0000-0000-000000000001";
+    const events = [event("event-1", sourceId, [])];
+
+    repositories.searchEntitiesByText.mockResolvedValue([]);
+    repositories.searchEntitiesByVector.mockResolvedValue([]);
+    repositories.searchEventsByTitleVector.mockResolvedValue(events);
+    repositories.getEventsWithEntityIds.mockResolvedValue(new Map(events.map((item) => [item.id, item])));
+    repositories.coarseRankEventsByContent.mockResolvedValue(events);
+    repositories.getSectionsForEvents.mockResolvedValue(events.map((item, index) => ({
+      eventId: item.id,
+      chunkId: `chunk-${index + 1}`,
+      sourceId,
+      documentId: item.documentId,
+      heading: item.title,
+      content: item.content,
+      rank: index,
+      score: 1
+    })));
+
+    const result = await service.search({
+      query: "项目人员证书要求和类似业绩评分怎么响应",
+      sourceIds: [sourceId],
+      strategy: "multi",
+      searchMode: "fast",
+      returnTrace: true,
+      topK: 5
+    });
+
+    expect(llm.extractNamedEntities).not.toHaveBeenCalled();
+    expect(result.trace?.queryEntities).toEqual(expect.arrayContaining([
+      "人员要求",
+      "人员证书要求",
+      "类似业绩要求",
+      "评分标准"
+    ]));
+    expect(result.trace?.recalledEntities).toHaveLength(0);
+  });
+
+  it("falls back to vector entity recall in fast mode when BM25 finds no entities", async () => {
+    const embeddings: EmbeddingClient = {
+      generate: vi.fn(async () => [1, 0, 0]),
+      batchGenerate: vi.fn()
+    };
+    const llm: LlmClient = {
+      extractNamedEntities: vi.fn(async () => ["不应调用"]),
+      extractEventsFromChunk: vi.fn(),
+      rerankEvents: vi.fn(async () => ["不应调用"])
+    };
+    const reranker: RerankClient = {
+      rerankEvents: vi.fn(async (input: { candidates: Array<{ id: string }>; topK: number }) => (
+        input.candidates.slice(0, input.topK).map((candidate) => candidate.id)
+      ))
+    };
+    const service = new SearchService(embeddings, llm, reranker);
+    const sourceId = "00000000-0000-0000-0000-000000000001";
+    const recalled = entity("entity-knowledge", sourceId, "知识库");
+    const events = [event("event-1", sourceId, [recalled.id])];
+
+    repositories.searchEntitiesByText.mockResolvedValue([]);
+    repositories.searchEntitiesByVector.mockResolvedValue([recalled]);
+    repositories.getEventIdsByEntityIds.mockResolvedValue(["event-1"]);
+    repositories.searchEventsByTitleVector.mockResolvedValue(events);
+    repositories.getEventsWithEntityIds.mockResolvedValue(new Map(events.map((item) => [item.id, item])));
+    repositories.coarseRankEventsByContent.mockResolvedValue(events);
+    repositories.getSectionsForEvents.mockResolvedValue(events.map((item, index) => ({
+      eventId: item.id,
+      chunkId: `chunk-${index + 1}`,
+      sourceId,
+      documentId: item.documentId,
+      heading: item.title,
+      content: item.content,
+      rank: index,
+      score: 1
+    })));
+
+    const result = await service.search({
+      query: "怎么导入资料",
+      sourceIds: [sourceId],
+      strategy: "multi",
+      searchMode: "fast",
+      returnTrace: true,
+      topK: 5
+    });
+
+    expect(llm.extractNamedEntities).not.toHaveBeenCalled();
+    expect(repositories.searchEntitiesByVector).toHaveBeenCalledWith(expect.objectContaining({
+      queryVector: [1, 0, 0],
+      threshold: 0.72
+    }));
+    expect(result.trace?.recalledEntities).toEqual([expect.objectContaining({ name: "知识库" })]);
+    expect(result.trace?.queryEntities).toEqual(expect.arrayContaining(["知识库"]));
+  });
+
+  it("infers recalled entities from semantically recalled events when direct entity recall is empty", async () => {
+    const embeddings: EmbeddingClient = {
+      generate: vi.fn(async () => [1, 0, 0]),
+      batchGenerate: vi.fn()
+    };
+    const llm: LlmClient = {
+      extractNamedEntities: vi.fn(async () => ["不应调用"]),
+      extractEventsFromChunk: vi.fn(),
+      rerankEvents: vi.fn(async () => ["不应调用"])
+    };
+    const reranker: RerankClient = {
+      rerankEvents: vi.fn(async (input: { candidates: Array<{ id: string }>; topK: number }) => (
+        input.candidates.slice(0, input.topK).map((candidate) => candidate.id)
+      ))
+    };
+    const service = new SearchService(embeddings, llm, reranker);
+    const sourceId = "00000000-0000-0000-0000-000000000001";
+    const inferred = entity("entity-upload", sourceId, "文件上传");
+    const events = [event("event-1", sourceId, [inferred.id])];
+
+    repositories.searchEntitiesByText.mockResolvedValue([]);
+    repositories.searchEntitiesByVector.mockResolvedValue([]);
+    repositories.getEventIdsByEntityIds.mockResolvedValue([]);
+    repositories.searchEventsByTitleVector.mockResolvedValue(events);
+    repositories.getEventsWithEntityIds.mockResolvedValue(new Map(events.map((item) => [item.id, item])));
+    repositories.getEntitiesByIds.mockResolvedValue([inferred]);
+    repositories.coarseRankEventsByContent.mockResolvedValue(events);
+    repositories.getSectionsForEvents.mockResolvedValue(events.map((item, index) => ({
+      eventId: item.id,
+      chunkId: `chunk-${index + 1}`,
+      sourceId,
+      documentId: item.documentId,
+      heading: item.title,
+      content: item.content,
+      rank: index,
+      score: 1
+    })));
+
+    const result = await service.search({
+      query: "怎么导入资料",
+      sourceIds: [sourceId],
+      strategy: "multi",
+      searchMode: "fast",
+      returnTrace: true,
+      topK: 5
+    });
+
+    expect(repositories.getEntitiesByIds).toHaveBeenCalledWith(expect.objectContaining({
+      entityIds: [inferred.id],
+      limit: 8
+    }));
+    expect(result.trace?.recalledEntities).toEqual([expect.objectContaining({ name: "文件上传" })]);
+    expect(result.trace?.queryEntities).toEqual(expect.arrayContaining(["文件上传"]));
+  });
+
+  it("expands intelligent-bidding questions into bid-domain entities", () => {
+    expect(expandBidQueryEntities("项目人员证书要求和类似业绩评分怎么响应")).toEqual(expect.arrayContaining([
+      "项目负责人要求",
+      "人员证书要求",
+      "类似业绩要求",
+      "评分标准"
+    ]));
+  });
+
+  it("attaches graph why explanation when strong edges and paths recall chunks", async () => {
+    const embeddings: EmbeddingClient = {
+      generate: vi.fn(async () => [1, 0, 0]),
+      batchGenerate: vi.fn()
+    };
+    const llm: LlmClient = {
+      extractNamedEntities: vi.fn(async () => ["项目负责人", "证书"]),
+      extractEventsFromChunk: vi.fn(),
+      rerankEvents: vi.fn(async (input: { candidates: Array<{ id: string }>; topK: number }) => input.candidates.slice(0, input.topK).map((candidate) => candidate.id))
+    };
+    const service = new SearchService(embeddings, llm);
+    const sourceId = "00000000-0000-0000-0000-000000000001";
+    const queryEntity = entity("entity-person", sourceId, "项目负责人");
+    const certificate = entity("entity-cert", sourceId, "信息系统项目管理师证书");
+    const recalledEvent = event("event-1", sourceId, [queryEntity.id, certificate.id]);
+    const edge = knowledgeEdge("edge-1", sourceId, recalledEvent.id, "chunk-1", queryEntity.id, certificate.id);
+    const path = {
+      nodes: [
+        { entityId: queryEntity.id, name: queryEntity.name },
+        { entityId: certificate.id, name: certificate.name }
+      ],
+      edges: [edge],
+      evidence: [{ edgeId: edge.id, text: edge.evidence!, confidence: edge.confidence }],
+      score: 0.91,
+      reason: "项目负责人 要求/需要 信息系统项目管理师证书"
+    };
+
+    repositories.searchEntitiesByName.mockResolvedValue([queryEntity, certificate]);
+    repositories.searchEntitiesByVector.mockResolvedValue([]);
+    repositories.getEventIdsByEntityIds.mockResolvedValue([recalledEvent.id]);
+    repositories.searchEventsByTitleVector.mockResolvedValue([]);
+    repositories.searchKnowledgeEdges.mockResolvedValue([edge]);
+    repositories.expandKnowledgeGraphPaths.mockResolvedValue([path]);
+    repositories.getEventsWithEntityIds.mockResolvedValue(new Map([[recalledEvent.id, recalledEvent]]));
+    repositories.coarseRankEventsByContent.mockResolvedValue([recalledEvent]);
+    repositories.getSectionsForEvents.mockResolvedValue([{
+      eventId: recalledEvent.id,
+      chunkId: "chunk-1",
+      sourceId,
+      documentId: recalledEvent.documentId,
+      heading: "资格要求",
+      content: "拟派项目负责人须具备信息系统项目管理师证书。",
+      rank: 0,
+      score: 1
+    }]);
+    repositories.getSectionsForKnowledgeEdges.mockResolvedValue([]);
+    repositories.getEdgesForSections.mockResolvedValue([edge]);
+
+    const result = await service.search({
+      query: "项目负责人证书怎么响应",
+      sourceIds: [sourceId],
+      strategy: "multi",
+      searchMode: "standard",
+      returnTrace: true,
+      useGraphPaths: true,
+      topK: 5
+    });
+
+    expect(result.trace?.recalledEdges).toHaveLength(1);
+    expect(result.trace?.graphPaths).toHaveLength(1);
+    expect(result.sections[0].why).toMatchObject({
+      recallType: "graph_path",
+      fallback: false
+    });
+    expect(result.sections[0].why?.matchedEdges[0]).toMatchObject({
+      relationType: "REQUIRES"
+    });
+    expect(result.sections[0].why?.evidence[0]?.text).toContain("项目负责人");
   });
 });
 
@@ -285,5 +560,34 @@ function event(id: string, sourceId: string, entityIds: string[]) {
     rank: 0,
     score: 1,
     entityIds
+  };
+}
+
+function knowledgeEdge(
+  id: string,
+  sourceId: string,
+  eventId: string,
+  chunkId: string,
+  subjectEntityId: string,
+  objectEntityId: string
+) {
+  return {
+    id,
+    sourceId,
+    documentId: "00000000-0000-0000-0000-000000000002",
+    chunkId,
+    eventId,
+    subjectEntityId,
+    objectEntityId,
+    subjectName: "项目负责人",
+    objectName: "信息系统项目管理师证书",
+    relationType: "REQUIRES",
+    relationLabel: "要求/需要",
+    evidence: "拟派项目负责人须具备信息系统项目管理师证书。",
+    confidence: 0.92,
+    qualityScore: 0.95,
+    status: "AUTO" as const,
+    score: 1,
+    metadata: {}
   };
 }

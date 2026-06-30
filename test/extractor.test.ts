@@ -41,4 +41,33 @@ describe("extractEventsFromChunk", () => {
     expect(events[0].title).toBe("第一个事项");
     expect(events[0].references).toEqual(["00000000-0000-0000-0000-000000000001"]);
   });
+
+  it("does not fall back to generic Introduction heading for empty event titles", async () => {
+    const llm: LlmClient = {
+      extractNamedEntities: vi.fn(async () => []),
+      rerankEvents: vi.fn(async () => []),
+      extractEventsFromChunk: vi.fn(async () => [
+        {
+          title: "",
+          summary: "",
+          content: "知识库支持文件上传和资料管理。",
+          category: "一般事项",
+          keywords: [],
+          references: [],
+          entities: []
+        }
+      ])
+    };
+
+    const events = await extractEventsFromChunk({
+      llm,
+      documentTitle: "操作手册",
+      heading: "Introduction",
+      content: "知识库支持文件上传和资料管理。",
+      references: ["00000000-0000-0000-0000-000000000002"]
+    });
+
+    expect(events[0].title).toContain("知识库支持文件上传");
+    expect(events[0].title).not.toBe("Introduction");
+  });
 });
